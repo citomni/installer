@@ -1,0 +1,33 @@
+# Normalize line endings across the repo
+* text=auto eol=lf
+
+# Keep only what's needed in the dist ZIP: src/, composer.json, LICENSE, README(+CHANGELOG)
+# Exclude dev/CI/IDE noise from Packagist/GitHub archives
+/.github                export-ignore
+/tests                  export-ignore
+/docs                   export-ignore
+/dev                    export-ignore
+/examples               export-ignore
+
+# Build/QA/CI artifacts
+/phpunit.xml*           export-ignore
+/.phpunit.result.cache  export-ignore
+/phpstan*.neon*         export-ignore
+/psalm*.xml*            export-ignore
+/.php-cs-fixer.php      export-ignore
+/.php-cs-fixer.dist.php export-ignore
+/Makefile               export-ignore
+
+# Editor/IDE files
+/.editorconfig          export-ignore
+/.gitignore             export-ignore
+/.gitattributes         export-ignore
+/.idea                  export-ignore
+/.vscode                export-ignore
+
+# Composer lock (usually not shipped with libraries)
+composer.lock           export-ignore
+
+# If you happen to have these (harmless to list even if absent)
+/scripts                export-ignore
+/stubs                  export-ignore

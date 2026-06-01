@@ -1,0 +1,68 @@
+{
+	"name": "citomni/installer",
+	"description": "Deterministic scaffold materializer and lifecycle tool for CitOmni applications.",
+	"type": "library",
+	"license": "MIT",
+	"homepage": "https://github.com/citomni/installer",
+	"keywords": [
+		"citomni",
+		"installer",
+		"scaffold",
+		"scaffold-materializer",
+		"lifecycle",
+		"sync",
+		"repair",
+		"composer",
+		"php",
+		"php8",
+		"low-overhead",
+		"deterministic"
+	],
+	"require": {
+		"php": "^8.2",
+		"citomni/kernel": "*@dev"
+	},
+	"bin": [
+		"bin/citomni-installer"
+	],
+	"autoload": {
+		"psr-4": {
+			"CitOmni\\Installer\\": "src/"
+		}
+	},
+	"autoload-dev": {
+		"psr-4": {
+			"CitOmni\\Installer\\Tests\\": "tests/"
+		}
+	},
+	"suggest": {
+		"citomni/http": "Provides HTTP runtime and package-owned HTTP scaffold manifests that citomni/installer can discover, install, repair, and sync.",
+		"citomni/cli": "Provides CLI runtime and package-owned CLI scaffold manifests that citomni/installer can discover, install, repair, and sync."
+	},
+	"support": {
+		"source": "https://github.com/citomni/installer",
+		"issues": "https://github.com/citomni/installer/issues"
+	},
+	"authors": [
+		{
+			"name": "Lars Grove Mortensen",
+			"homepage": "https://www.citomni.com/",
+			"role": "Developer"
+		}
+	],
+	"archive": {
+		"exclude": [
+			"/.github",
+			"/docs",
+			"/dev",
+			"/examples",
+			"/.editorconfig",
+			"/.gitattributes",
+			"/.gitignore",
+			"/phpunit.xml*",
+			"/.idea",
+			"/.vscode",
+			"/Makefile"
+		]
+	}
+}
