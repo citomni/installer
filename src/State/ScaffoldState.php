@@ -34,7 +34,8 @@ use CitOmni\Installer\Exception\InstallerException;
  *   so a downgrade can never destroy a newer installer's state.
  *
  * Atomic write (§5):
- * - Render to a temp file in the SAME directory, flush + best-effort fsync, then rename
+ * - Render to a temp file in the SAME directory, flush, best-effort fsync when
+ *   available, then rename
  *   over the target. rename() is atomic on POSIX and modern Windows when both paths are
  *   on the same filesystem (guaranteed by writing the temp file beside the target).
  *
@@ -260,12 +261,16 @@ final class ScaffoldState {
 		}
 
 		try {
-			if (\fwrite($handle, $code) === false) {
-				throw new InstallerException(\sprintf('Failed to write temp state file: %s', $tmp));
+			$written = \fwrite($handle, $code);
+			if ($written === false || $written !== \strlen($code)) {
+				throw new InstallerException(\sprintf('Failed to write complete temp state file: %s', $tmp));
 			}
+
 			\fflush($handle);
 			// Best-effort durability; not every filesystem supports fsync.
-			@\fsync($handle);
+			if (\function_exists('fsync')) {
+				@\fsync($handle);
+			}
 		} catch (\Throwable $e) {
 			\fclose($handle);
 			@\unlink($tmp);

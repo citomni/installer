@@ -1,0 +1,85 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+/*
+ * This file is part of the CitOmni framework.
+ * Low overhead, high performance, ready for anything.
+ *
+ * For more information, visit https://github.com/citomni
+ *
+ * Copyright (c) 2012-present Lars Grove Mortensen
+ * SPDX-License-Identifier: MIT
+ *
+ * For full copyright, trademark, and license information,
+ * please see the LICENSE file distributed with this source code.
+ */
+
+/*
+ * Own thin dispatcher for citomni/installer.
+ *
+ * This is NOT a CitOmni CLI runtime: it does not boot citomni/cli, citomni/http
+ * or citomni/kernel. Its only jobs are:
+ *   1) Refuse to run outside the CLI SAPI.
+ *   2) Locate the Composer autoloader (Composer-provided first, then fallbacks).
+ *   3) Derive the application root (the directory that owns vendor/).
+ *   4) Hand control to CitOmni\Installer\Cli\InstallerCli and exit with its code.
+ *
+ * All decision-making, parsing and formatting live in the CLI layer; nothing
+ * here is framework-aware.
+ */
+
+if (\PHP_SAPI !== 'cli') {
+	\fwrite(\STDERR, "citomni-installer must be run from the command line.\n");
+	exit(1);
+}
+
+// -- 1. Locate the Composer autoloader ------------------------------------
+// Composer 2 exposes the autoload path to bin proxies via $_composer_autoload_path.
+// Fall back to known relative locations for direct execution and dev checkouts.
+$autoload = $_composer_autoload_path ?? ($GLOBALS['_composer_autoload_path'] ?? null);
+
+if (!\is_string($autoload) || !\is_file($autoload)) {
+	$autoload = null;
+	$candidates = [
+		__DIR__ . '/../../../autoload.php',   // installed: vendor/citomni/installer/bin -> vendor/autoload.php
+		__DIR__ . '/../vendor/autoload.php',  // standalone dev checkout
+	];
+	foreach ($candidates as $candidate) {
+		if (\is_file($candidate)) {
+			$autoload = $candidate;
+			break;
+		}
+	}
+}
+
+if ($autoload === null) {
+	\fwrite(\STDERR, "Unable to locate the Composer autoloader. Run 'composer install' first.\n");
+	exit(1);
+}
+
+require $autoload;
+
+// -- 2. Derive the application root ----------------------------------------
+// The app root is the current working directory: the installer operates on the
+// project you run it from, never on "wherever vendor/ happens to live". The
+// autoloader above is used ONLY to load classes, not to locate the app.
+$appRoot = \getcwd();
+if ($appRoot === false) {
+	\fwrite(\STDERR, "Unable to determine the current working directory.\n");
+	exit(\CitOmni\Installer\Enum\ExitCode::IO_ERROR->value);
+}
+if (!\is_file($appRoot . '/composer.json')) {
+	\fwrite(\STDERR, "Not a project root: no composer.json found in {$appRoot}.\n");
+	\fwrite(\STDERR, "Run citomni-installer from your application root.\n");
+	exit(\CitOmni\Installer\Enum\ExitCode::IO_ERROR->value);
+}
+
+// -- 3. Dispatch -----------------------------------------------------------
+try {
+	$cli = new \CitOmni\Installer\Cli\InstallerCli($appRoot);
+	exit($cli->run($argv));
+} catch (\Throwable $e) {
+	// Last-resort boundary: the CLI layer maps known errors to exit codes itself.
+	\fwrite(\STDERR, 'Fatal: ' . $e->getMessage() . "\n");
+	exit(\CitOmni\Installer\Enum\ExitCode::GENERAL_ERROR->value);
+}
