@@ -20,7 +20,7 @@
 	],
 	"require": {
 		"php": "^8.2",
-		"citomni/kernel": "*@dev"
+		"citomni/kernel": "^1.0"
 	},
 	"bin": [
 		"bin/citomni-installer"
@@ -64,5 +64,10 @@
 			"/.vscode",
 			"/Makefile"
 		]
+	},
+	"extra": {
+		"branch-alias": {
+			"dev-main": "1.0.x-dev"
+		}
 	}
 }
