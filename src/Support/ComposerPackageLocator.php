@@ -54,10 +54,10 @@ final class ComposerPackageLocator {
 	private const MANIFEST_SCHEMA_VERSIONS = [1];
 
 	/** Convention manifest location, relative to a package root. */
-	private const CONVENTION_MANIFEST = 'resources/citomni/scaffold.php';
+	private const CONVENTION_MANIFEST = 'install/manifest.php';
 
 	/** Known file policies (contract §8). */
-	private const KNOWN_POLICIES = ['managed', 'create-only', 'sample'];
+	private const KNOWN_POLICIES = ['managed', 'create-only'];
 
 	/** Absolute path to the Composer vendor directory. */
 	private string $vendorDir;

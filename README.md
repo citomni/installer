@@ -47,7 +47,7 @@ No smoke, no mirrors, and preferably no wizard hat in production.
 
 - Discovery of installed Composer packages.
 - Support for scaffold manifests declared through `extra.citomni.scaffold`.
-- Convention fallback to `resources/citomni/scaffold.php` when no explicit Composer extra value exists.
+- Convention fallback to `install/manifest.php` when no explicit Composer extra value exists.
 - Manifest validation, package-name validation, and manifest version validation.
 - Deterministic path normalization and guard checks before any write operation.
 
@@ -66,7 +66,8 @@ No smoke, no mirrors, and preferably no wizard hat in production.
 - `install` for first-time package scaffold materialization.
 - `repair` for recreating missing scaffold files from the currently installed package version.
 - `sync` for controlled updates of managed scaffold files.
-- `diff` for comparing local files against the current rendered upstream version.
+
+Post-MVP may add `diff` for comparing local files against the current rendered upstream version.
 
 ### Integration output
 
@@ -148,12 +149,14 @@ Package-owned scaffold should live in the package that owns the runtime function
 Examples:
 
 ```text
-vendor/citomni/http/resources/scaffold/public/index.php.stub
-vendor/citomni/http/resources/scaffold/config/citomni_http_cfg.php.stub
-vendor/citomni/http/resources/scaffold/config/citomni_http_routes.php.stub
+vendor/citomni/http/install/manifest.php
+vendor/citomni/http/install/scaffold/public/index.php.stub
+vendor/citomni/http/install/scaffold/config/citomni_http_cfg.php.stub
+vendor/citomni/http/install/scaffold/config/citomni_http_routes.php.stub
 
-vendor/citomni/cli/resources/scaffold/bin/citomni.stub
-vendor/citomni/cli/resources/scaffold/config/citomni_cli_cfg.php.stub
+vendor/citomni/cli/install/manifest.php
+vendor/citomni/cli/install/scaffold/bin/citomni.stub
+vendor/citomni/cli/install/scaffold/config/citomni_cli_cfg.php.stub
 ```
 
 Those stubs are the package-owned reference versions. The materialized files in the app are app-local runtime artifacts derived from those stubs.
@@ -184,15 +187,17 @@ It may provide the application container and base structure, such as:
 
 ```text
 composer.json
+.gitattributes
 .gitignore
+.htaccess
+LICENSE
+NOTICE
 README.md
+TRADEMARKS.md
 bin/
 config/
-config/citomni_installer.php
-docs/
 language/
 src/
-templates/
 tests/
 var/
 ```
@@ -203,7 +208,7 @@ Examples:
 
 - `public/index.php` comes from `citomni/http`.
 - `bin/citomni` comes from `citomni/cli`.
-- `config/citomni_installer.php` belongs to the app and provides versioned placeholder configuration.
+- `config/citomni_installer.php` may be added by the app to provide versioned placeholder configuration when scaffold placeholders are needed.
 
 After `composer create-project`, root-level files are app-owned. `citomni/installer` must not rewrite the app README, `.gitignore`, `composer.json`, or `composer.lock` during normal operation.
 
@@ -302,7 +307,6 @@ Example:
 		"citomni:install": "vendor/bin/citomni-installer install",
 		"citomni:sync": "vendor/bin/citomni-installer sync",
 		"citomni:repair": "vendor/bin/citomni-installer repair",
-		"citomni:diff": "vendor/bin/citomni-installer diff",
 		"citomni:doctor": "vendor/bin/citomni-installer doctor"
 	}
 }
@@ -416,21 +420,10 @@ Conflict example:
 ```text
 public/index.php changed locally and was not overwritten.
 New upstream version written to public/index.php.new
-Run vendor/bin/citomni-installer diff public/index.php
+Review public/index.php and public/index.php.new before merging manually.
 ```
 
-### `diff`
-
-Shows differences between a local app file and the current rendered upstream scaffold.
-
-Examples:
-
-```bash
-vendor/bin/citomni-installer diff public/index.php
-vendor/bin/citomni-installer diff --package=citomni/http
-```
-
-A first implementation may provide a two-way diff. A future version may add three-way comparison between previous rendered baseline, local file, and current rendered upstream.
+Post-MVP may add a `diff` command for comparing local app files against the current rendered upstream scaffold.
 
 ---
 
@@ -444,7 +437,7 @@ Composer `extra` is the primary discovery mechanism:
 {
 	"extra": {
 		"citomni": {
-			"scaffold": "resources/citomni/scaffold.php"
+			"scaffold": "install/manifest.php"
 		}
 	}
 }
@@ -453,10 +446,12 @@ Composer `extra` is the primary discovery mechanism:
 If no explicit value exists, the installer may fall back to:
 
 ```text
-resources/citomni/scaffold.php
+install/manifest.php
 ```
 
 If both exist and point to different paths, the Composer `extra` value wins.
+
+The manifest's scaffold source base is normally `install/scaffold/`.
 
 Example manifest:
 
@@ -471,19 +466,19 @@ return [
 	'files' => [
 		[
 			'target' => 'public/index.php',
-			'source' => 'resources/scaffold/public/index.php.stub',
+			'source' => 'install/scaffold/public/index.php.stub',
 			'type' => 'entrypoint',
 			'policy' => 'managed',
 		],
 		[
 			'target' => 'config/citomni_http_cfg.php',
-			'source' => 'resources/scaffold/config/citomni_http_cfg.php.stub',
+			'source' => 'install/scaffold/config/citomni_http_cfg.php.stub',
 			'type' => 'config',
 			'policy' => 'create-only',
 		],
 		[
 			'target' => 'config/citomni_http_routes.php',
-			'source' => 'resources/scaffold/config/citomni_http_routes.php.stub',
+			'source' => 'install/scaffold/config/citomni_http_routes.php.stub',
 			'type' => 'routes',
 			'policy' => 'create-only',
 		],
@@ -596,7 +591,7 @@ MVP placeholder rules:
 - Resolve placeholders from deterministic sources.
 - Store the actual placeholder snapshot used for each rendered file in installer state.
 
-The application-level placeholder config should live here:
+When scaffold placeholders are needed, the application-level placeholder config should live here:
 
 ```text
 config/citomni_installer.php
@@ -618,13 +613,12 @@ return [
 ];
 ```
 
-Recommended placeholder priority:
+MVP placeholder priority:
 
 1. CLI options.
 2. `config/citomni_installer.php`.
-3. `composer.json`.
-4. Existing CitOmni config.
-5. Explicit package defaults.
+
+Future versions may add Composer metadata, existing CitOmni config, or explicit package defaults.
 
 Example:
 
@@ -728,7 +722,7 @@ Examples:
 
 ## JSON output
 
-Most commands should support JSON output.
+All MVP commands support JSON output.
 
 Example:
 
