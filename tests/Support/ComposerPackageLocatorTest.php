@@ -122,7 +122,7 @@ final class ComposerPackageLocatorTest extends TestCase {
 	public function testDiscoversConventionManifest(): void {
 		$this->writeInstalledJson([
 			$this->package('citomni/http', [
-				'manifest_at' => 'resources/citomni/scaffold.php',
+				'manifest_at' => 'install/manifest.php',
 				'manifest'    => $this->manifest('citomni/http', 1, $this->validFiles()),
 				'stubs'       => ['resources/scaffold/public/index.php.stub'],
 			]),
@@ -136,7 +136,7 @@ final class ComposerPackageLocatorTest extends TestCase {
 		$this->assertSame('1.0.0', $result['citomni/http']['installed_version']);
 		$this->assertSame('public/index.php', $result['citomni/http']['files'][0]['target']);
 		$this->assertSame('managed', $result['citomni/http']['files'][0]['policy']);
-		$this->assertStringEndsWith('/resources/citomni/scaffold.php', $result['citomni/http']['manifest_path']);
+		$this->assertStringEndsWith('/install/manifest.php', $result['citomni/http']['manifest_path']);
 		$this->assertStringEndsWith('/resources/scaffold/public/index.php.stub', $result['citomni/http']['files'][0]['source_path']);
 	}
 
@@ -170,7 +170,7 @@ final class ComposerPackageLocatorTest extends TestCase {
 		$conv = $this->manifest('citomni/http', 1, [
 			['target' => 'config/conv.php', 'source' => 's/conv.stub', 'type' => 'config', 'policy' => 'create-only'],
 		]);
-		$convPath = $this->vendorDir . '/citomni/http/resources/citomni/scaffold.php';
+		$convPath = $this->vendorDir . '/citomni/http/install/manifest.php';
 		@\mkdir(\dirname($convPath), 0777, true);
 		\file_put_contents($convPath, '<?php return ' . \var_export($conv, true) . ";\n");
 
@@ -190,7 +190,7 @@ final class ComposerPackageLocatorTest extends TestCase {
 	public function testComposer1TopLevelListIsParsed(): void {
 		$this->writeInstalledJson([
 			$this->package('citomni/http', [
-				'manifest_at' => 'resources/citomni/scaffold.php',
+				'manifest_at' => 'install/manifest.php',
 				'manifest'    => $this->manifest('citomni/http', 1, $this->validFiles()),
 			]),
 		], true);
@@ -206,7 +206,7 @@ final class ComposerPackageLocatorTest extends TestCase {
 	public function testDiscoverPackage(): void {
 		$this->writeInstalledJson([
 			$this->package('citomni/http', [
-				'manifest_at' => 'resources/citomni/scaffold.php',
+				'manifest_at' => 'install/manifest.php',
 				'manifest'    => $this->manifest('citomni/http', 1, $this->validFiles()),
 			]),
 			$this->package('acme/lib'),
@@ -226,7 +226,7 @@ final class ComposerPackageLocatorTest extends TestCase {
 	public function testPackageNameMismatchFails(): void {
 		$this->writeInstalledJson([
 			$this->package('citomni/http', [
-				'manifest_at' => 'resources/citomni/scaffold.php',
+				'manifest_at' => 'install/manifest.php',
 				'manifest'    => $this->manifest('wrong/name', 1, $this->validFiles()),
 			]),
 		]);
@@ -240,7 +240,7 @@ final class ComposerPackageLocatorTest extends TestCase {
 	public function testUnknownSchemaVersionFails(): void {
 		$this->writeInstalledJson([
 			$this->package('citomni/http', [
-				'manifest_at' => 'resources/citomni/scaffold.php',
+				'manifest_at' => 'install/manifest.php',
 				'manifest'    => $this->manifest('citomni/http', 2, $this->validFiles()),
 			]),
 		]);
@@ -255,7 +255,7 @@ final class ComposerPackageLocatorTest extends TestCase {
 		$files = [['target' => 'public/index.php', 'source' => '../../../etc/passwd', 'type' => 'entrypoint', 'policy' => 'managed']];
 		$this->writeInstalledJson([
 			$this->package('citomni/http', [
-				'manifest_at' => 'resources/citomni/scaffold.php',
+				'manifest_at' => 'install/manifest.php',
 				'manifest'    => $this->manifest('citomni/http', 1, $files),
 			]),
 		]);
@@ -287,7 +287,7 @@ final class ComposerPackageLocatorTest extends TestCase {
 		$files = [['target' => $badTarget, 'source' => 'resources/x.stub', 'type' => 'entrypoint', 'policy' => 'managed']];
 		$this->writeInstalledJson([
 			$this->package('citomni/http', [
-				'manifest_at' => 'resources/citomni/scaffold.php',
+				'manifest_at' => 'install/manifest.php',
 				'manifest'    => $this->manifest('citomni/http', 1, $files),
 			]),
 		]);
@@ -304,7 +304,7 @@ final class ComposerPackageLocatorTest extends TestCase {
 		];
 		$this->writeInstalledJson([
 			$this->package('citomni/http', [
-				'manifest_at' => 'resources/citomni/scaffold.php',
+				'manifest_at' => 'install/manifest.php',
 				'manifest'    => $this->manifest('citomni/http', 1, $files),
 			]),
 		]);
@@ -319,7 +319,7 @@ final class ComposerPackageLocatorTest extends TestCase {
 		$files = [['target' => 'public/index.php', 'source' => 'a.stub', 'type' => 'entrypoint', 'policy' => 'frobnicate']];
 		$this->writeInstalledJson([
 			$this->package('citomni/http', [
-				'manifest_at' => 'resources/citomni/scaffold.php',
+				'manifest_at' => 'install/manifest.php',
 				'manifest'    => $this->manifest('citomni/http', 1, $files),
 			]),
 		]);
@@ -334,7 +334,7 @@ final class ComposerPackageLocatorTest extends TestCase {
 		$files = [['target' => 'public/index.php', 'type' => 'entrypoint', 'policy' => 'managed']];
 		$this->writeInstalledJson([
 			$this->package('citomni/http', [
-				'manifest_at' => 'resources/citomni/scaffold.php',
+				'manifest_at' => 'install/manifest.php',
 				'manifest'    => $this->manifest('citomni/http', 1, $files),
 			]),
 		]);

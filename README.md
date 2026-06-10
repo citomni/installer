@@ -404,7 +404,7 @@ Default behavior:
 - Does not overwrite existing files.
 - Uses previously registered placeholder values when state exists.
 - Updates the baseline for files it recreates.
-- Warns when state points to an older stub checksum than the currently installed package provides.
+- Reports `recreated_stub_drift` when the recorded stub checksum differs from the currently installed package stub.
 
 Example:
 
@@ -418,7 +418,7 @@ Updates managed scaffold files safely.
 
 Default behavior:
 
-- Creates missing managed files.
+- Creates missing scaffold files, including missing `managed` and `create-only` targets.
 - Updates files that still match the previous rendered baseline.
 - Does not overwrite locally modified files.
 - Writes the new upstream version to `.new` when a local modification blocks automatic sync.
@@ -758,19 +758,19 @@ Example:
 vendor/bin/citomni-installer status --format=json
 ```
 
-JSON output should be stable enough for project tooling and automation. It should include package name, type, policy, target, status, reason, and whether sync is possible without conflict.
+JSON output should be stable enough for project tooling and automation. It includes package name, type, policy, target, status, reason, and action values that tooling can use to infer whether a file can be synced without conflict.
 
 Interactive confirmation is not available in JSON mode. When a forced overwrite is required, automation must use `--force=yes`; plain `--force --format=json` returns an invalid-usage response instead of prompting.
 
-Reason values should distinguish at least:
+Status, reason, and error values should distinguish at least:
 
 - Missing target.
 - Local modification.
 - Upstream stub drift.
 - Placeholder drift.
-- Invalid manifest.
-- Unsafe state.
-- Permission issue.
+- Invalid manifest, usually as a top-level command error or `doctor` check.
+- Unsafe state, usually as a top-level command error or `doctor` check.
+- Permission issue, usually as a top-level command error or `doctor` check.
 
 Human output can be friendly. JSON output should be boring. Boring is a feature when another program has to parse it.
 

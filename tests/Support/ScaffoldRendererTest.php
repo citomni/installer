@@ -52,6 +52,14 @@ final class ScaffoldRendererTest extends TestCase {
 	}
 
 
+	public function testTrimsWhitespaceInsidePlaceholderBraces(): void {
+		$this->assertSame(
+			'My App/App',
+			$this->renderer->render('{{ APP_NAME }}/{{ APP_NAMESPACE }}', $this->values())
+		);
+	}
+
+
 	public function testReplacesRepeatedToken(): void {
 		$this->assertSame(
 			'App/App/App',
@@ -116,7 +124,6 @@ final class ScaffoldRendererTest extends TestCase {
 	 */
 	public static function malformedStubs(): array {
 		return [
-			'surrounding spaces' => ['{{ APP_NAME }}'],
 			'lowercase'          => ['{{app_name}}'],
 			'leading digit'      => ['{{1APP}}'],
 			'hyphen'             => ['{{APP-NAME}}'],

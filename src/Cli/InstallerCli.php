@@ -157,7 +157,7 @@ final class InstallerCli {
 	 * Recognised: --package=<vendor/name>, --format=text|json,
 	 * --placeholder=KEY=VALUE (repeatable), --force, --force=yes,
 	 * --dry-run, --help/-h.
-	 * Positional arguments are rejected here (only sync/diff accept them).
+	 * Positional arguments are rejected here (only sync accepts one).
 	 *
 	 * @param  array<int,string>  $args  Arguments after the command name.
 	 * @return array{ok:true,options:array{package:?string,format:string,placeholders:array<string,string>,force:bool,force_confirmed:bool,dry_run:bool,help:bool}}|array{ok:false,error:string}
@@ -275,7 +275,7 @@ Commands:
   status    Report scaffold state per package.
   install   Create missing scaffold files and record their baseline.
   repair    Recreate missing files from recorded state.
-  sync      Update managed files forward to the current baseline.
+  sync      Sync package-owned scaffold to the current baseline.
 
 Global options:
   --package=<vendor/name>   Limit to a single package.
@@ -364,18 +364,19 @@ Exit codes:
 
 TXT,
 			'sync' => <<<TXT
-citomni-installer sync — controlled update of managed files
+citomni-installer sync — controlled scaffold sync
 
 Usage:
   citomni-installer sync [target] [--package=<vendor/name>] [--format=text|json]
                          [--placeholder=KEY=VALUE ...] [--force] [--dry-run]
 
-Moves managed files forward to the current stub/placeholders, but only while the
-file on disk still matches its recorded baseline. Locally modified files are never 
-overwritten by default: a sibling <target>.new is written instead. With --force, 
-the existing file is backed up and replaced after confirmation; use --force=yes 
-to confirm without prompting. An optional positional [target] limits
-the run to a single app-relative file. Use --dry-run to preview.
+Creates missing scaffold files and moves managed files forward to the current
+stub/placeholders, but only while the file on disk still matches its recorded
+baseline. Locally modified files are never overwritten by default: a sibling
+<target>.new is written instead. With --force, the existing file is backed up and
+replaced after confirmation; use --force=yes to confirm without prompting. An
+optional positional [target] limits the run to a single app-relative file. Use
+--dry-run to preview.
 
 Exit codes:
   0  up to date / applied      4  conflicts / .new written (manual action)
