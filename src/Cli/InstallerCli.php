@@ -142,6 +142,11 @@ final class InstallerCli {
 	}
 
 
+
+
+
+
+
 	// ----------------------------------------------------------------
 	// Shared helpers (used by the commands)
 	// ----------------------------------------------------------------
@@ -150,35 +155,52 @@ final class InstallerCli {
 	 * Parse the common CLI grammar shared by all installer commands.
 	 *
 	 * Recognised: --package=<vendor/name>, --format=text|json,
-	 * --placeholder=KEY=VALUE (repeatable), --force, --dry-run, --help/-h.
+	 * --placeholder=KEY=VALUE (repeatable), --force, --force=yes,
+	 * --dry-run, --help/-h.
 	 * Positional arguments are rejected here (only sync/diff accept them).
 	 *
 	 * @param  array<int,string>  $args  Arguments after the command name.
-	 * @return array{ok:true,options:array{package:?string,format:string,placeholders:array<string,string>,force:bool,dry_run:bool,help:bool}}|array{ok:false,error:string}
+	 * @return array{ok:true,options:array{package:?string,format:string,placeholders:array<string,string>,force:bool,force_confirmed:bool,dry_run:bool,help:bool}}|array{ok:false,error:string}
 	 */
 	public static function parseCommonOptions(array $args): array {
+
 		$options = [
-			'package'      => null,
-			'format'       => 'text',
-			'placeholders' => [],
-			'force'        => false,
-			'dry_run'      => false,
-			'help'         => false,
+			'package'         => null,
+			'format'          => 'text',
+			'placeholders'    => [],
+			'force'           => false,
+			'force_confirmed' => false,
+			'dry_run'         => false,
+			'help'            => false,
 		];
 
 		foreach ($args as $arg) {
+
 			if ($arg === '--help' || $arg === '-h') {
 				$options['help'] = true;
 				continue;
 			}
+
 			if ($arg === '--force') {
 				$options['force'] = true;
+				$options['force_confirmed'] = false;
 				continue;
 			}
+			if (\str_starts_with($arg, '--force=')) {
+				$value = \substr($arg, 8);
+				if ($value !== 'yes') {
+					return self::usageError("Invalid value for --force: '{$value}' (expected 'yes').");
+				}
+				$options['force'] = true;
+				$options['force_confirmed'] = true;
+				continue;
+			}
+
 			if ($arg === '--dry-run') {
 				$options['dry_run'] = true;
 				continue;
 			}
+
 			if (\str_starts_with($arg, '--format=')) {
 				$value = \substr($arg, 9);
 				if ($value !== 'text' && $value !== 'json') {
@@ -187,6 +209,7 @@ final class InstallerCli {
 				$options['format'] = $value;
 				continue;
 			}
+
 			if (\str_starts_with($arg, '--package=')) {
 				$value = \substr($arg, 10);
 				if ($value === '' || \preg_match('#^[^/\s]+/[^/\s]+$#', $value) !== 1) {
@@ -195,6 +218,7 @@ final class InstallerCli {
 				$options['package'] = $value;
 				continue;
 			}
+
 			if (\str_starts_with($arg, '--placeholder=')) {
 				$pair = \substr($arg, 14);
 				$eq   = \strpos($pair, '=');
@@ -241,7 +265,7 @@ final class InstallerCli {
 
 	private function topUsage(): string {
 		return <<<TXT
-citomni-installer — CitOmni scaffold installer (read-only commands)
+citomni-installer — CitOmni scaffold installer and repair tool
 
 Usage:
   citomni-installer <command> [options]
@@ -257,7 +281,8 @@ Global options:
   --package=<vendor/name>   Limit to a single package.
   --format=text|json        Output format (default: text).
   --placeholder=KEY=VALUE   Provide a placeholder value (repeatable; overrides config).
-  --force                   Overwrite existing files (write commands; backs up first).
+  --force                   Force overwrite, but ask before writing.
+  --force=yes               Force overwrite without asking (backs up first).
   --dry-run                 Preview without writing (write commands).
   --help, -h                Show help.
 
@@ -308,12 +333,13 @@ citomni-installer install — first materialization for a package
 
 Usage:
   citomni-installer install [--package=<vendor/name>] [--format=text|json]
-                            [--placeholder=KEY=VALUE ...] [--force] [--dry-run]
+                            [--placeholder=KEY=VALUE ...] [--force|--force=yes] [--dry-run]
 
 Creates missing managed and create-only files from the current stubs and records
 their baseline (stub + rendered checksums, policy, placeholder snapshot) in the
-state file. Existing files are NOT overwritten unless --force is given, in which
-case the previous file is backed up first. Use --dry-run to preview.
+state file. Existing files are NOT overwritten unless --force is given. Forced 
+overwrites are backed up first. Plain --force asks before writing; --force=yes 
+confirms without prompting. Use --dry-run to preview.
 
 Exit codes:
   0  applied / nothing to do   4  conflicts (existing files in the way)
@@ -345,9 +371,10 @@ Usage:
                          [--placeholder=KEY=VALUE ...] [--force] [--dry-run]
 
 Moves managed files forward to the current stub/placeholders, but only while the
-file on disk still matches its recorded baseline. Locally modified files are never
-overwritten: a sibling <target>.new is written instead, unless --force is given
-(which backs up the existing file first). An optional positional [target] limits
+file on disk still matches its recorded baseline. Locally modified files are never 
+overwritten by default: a sibling <target>.new is written instead. With --force, 
+the existing file is backed up and replaced after confirmation; use --force=yes 
+to confirm without prompting. An optional positional [target] limits
 the run to a single app-relative file. Use --dry-run to preview.
 
 Exit codes:

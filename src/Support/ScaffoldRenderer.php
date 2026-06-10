@@ -78,9 +78,9 @@ final class ScaffoldRenderer {
 			self::TOKEN_PATTERN,
 			function (array $m) use ($values): string {
 				$token = $m[0];
-				$key   = $m[1];
+				$key   = \trim($m[1]);
 
-				if (\preg_match(self::KEY_PATTERN, $key) !== 1) {
+				if ($key === '' || \preg_match(self::KEY_PATTERN, $key) !== 1) {
 					throw new InstallerException(\sprintf('Malformed placeholder token: %s', $token));
 				}
 
@@ -128,9 +128,12 @@ final class ScaffoldRenderer {
 
 		$found = [];
 		foreach ($matches[1] as $i => $key) {
-			if (\preg_match(self::KEY_PATTERN, $key) !== 1) {
+			$key = \trim($key);
+
+			if ($key === '' || \preg_match(self::KEY_PATTERN, $key) !== 1) {
 				throw new InstallerException(\sprintf('Malformed placeholder token: %s', $matches[0][$i]));
 			}
+
 			$found[$key] = true;
 		}
 

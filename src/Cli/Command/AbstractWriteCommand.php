@@ -138,6 +138,11 @@ abstract class AbstractWriteCommand {
 			);
 		}
 
+		$confirmExit = $this->confirmForcedPlanIfNeeded($plan, $format, $opt);
+		if ($confirmExit !== null) {
+			return $confirmExit;
+		}
+
 		// -- 6. Apply the plan (the only writer) ----------------------
 		try {
 			$result = $this->applier->apply($plan, ['dry_run' => $opt['dry_run']]);
@@ -195,6 +200,81 @@ abstract class AbstractWriteCommand {
 		$one = $this->locator->discoverPackage($package);
 		return $one === null ? [] : [$package => $one];
 	}
+
+
+	/**
+	 * Ask for confirmation before applying destructive forced overwrites.
+	 *
+	 * @param  array<string,mixed>  $plan
+	 * @param  array<string,mixed>  $opt
+	 * @return ?int  Null when execution may continue; otherwise an exit code.
+	 */
+	private function confirmForcedPlanIfNeeded(array $plan, string $format, array $opt): ?int {
+		if (empty($opt['force']) || !empty($opt['force_confirmed']) || !empty($opt['dry_run'])) {
+			return null;
+		}
+
+		$count = $this->countForcedOverwrites($plan);
+		if ($count === 0) {
+			return null;
+		}
+
+		if ($format === 'json') {
+			return $this->fail(
+				$format,
+				'Interactive confirmation is not available with --format=json. Use --force=yes to confirm forced overwrites.',
+				ExitCode::USAGE_ERROR->value
+			);
+		}
+
+		if (!\defined('STDIN') || !\is_resource(\STDIN)) {
+			return $this->fail(
+				$format,
+				'Interactive confirmation is not available. Use --force=yes to confirm forced overwrites.',
+				ExitCode::USAGE_ERROR->value
+			);
+		}
+
+		\fwrite(\STDOUT, \sprintf(
+			"Force will overwrite %d existing file%s and create backup%s.\n",
+			$count,
+			$count === 1 ? '' : 's',
+			$count === 1 ? '' : 's'
+		));
+		\fwrite(\STDOUT, "Type 'yes' to continue: ");
+
+		$answer = \fgets(\STDIN);
+		if (\strtolower(\trim((string)$answer)) !== 'yes') {
+			return $this->fail($format, 'Cancelled by user.', ExitCode::GENERAL_ERROR->value);
+		}
+
+		return null;
+	}
+
+	/**
+	 * Count planned entries that force-overwrite existing files.
+	 *
+	 * @param  array<string,mixed>  $plan
+	 * @return int
+	 */
+	private function countForcedOverwrites(array $plan): int {
+		$count = 0;
+
+		foreach ((array)($plan['packages'] ?? []) as $pkg) {
+			foreach ((array)($pkg['files'] ?? []) as $file) {
+				if ((string)($file['reason'] ?? '') === 'forced_overwrite' || !empty($file['backup'])) {
+					$count++;
+				}
+			}
+		}
+
+		return $count;
+	}
+
+
+
+
+
 
 
 	// ----------------------------------------------------------------
