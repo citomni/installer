@@ -15,10 +15,10 @@ In practical terms, `citomni/installer` lets CitOmni keep `citomni/app-skeleton`
 - **Official scaffold lifecycle tool for CitOmni** with explicit ownership of scaffold discovery, rendering, planning, status, repair, sync, and state.
 - **Composer-native model** where scaffold files come from the currently installed package versions, not from live GitHub fetches or mutable remote templates.
 - **Neutral app skeleton support** so `citomni/app-skeleton` can remain a thin application container instead of a pile of mode-specific runtime files.
-- **Conservative write behavior** with no blind overwrites, `.new` files for blocked upstream updates, and backups before forced replacement.
+- **Conservative write behavior** with no blind overwrites, `.new` files for blocked upstream updates, confirmation before plain forced replacement, and backups before overwriting existing files.
 - **Stateful managed-file sync** using both raw stub checksums and rendered-file checksums to separate upstream scaffold drift from local changes.
 - **Bootstrap-independent CLI** through `vendor/bin/citomni-installer`, without requiring `citomni/cli`, `citomni/http`, or a running CitOmni application.
-- **Stable JSON output** for DevKit, CI, deploy hooks, and other tooling that needs machine-readable scaffold status.
+- **Stable JSON output** for project tooling, CI, deploy hooks, and other automation that needs machine-readable scaffold status.
 
 ---
 
@@ -72,7 +72,7 @@ Post-MVP may add `diff` for comparing local files against the current rendered u
 ### Integration output
 
 - Human-readable CLI output by default.
-- JSON output for DevKit, CI, deployment tooling, and automation.
+- JSON output for project tooling, CI, deployment tooling, and automation.
 - Stable machine-readable status and reason values for scaffold drift, missing files, local changes, and blocked sync.
 
 ---
@@ -92,7 +92,7 @@ That includes:
 - App-local scaffold state format.
 - Checksum semantics for raw stubs and rendered files.
 - Read-only status and doctor diagnostics.
-- JSON output intended for DevKit and other tooling.
+- JSON output intended for project tooling and other automation.
 
 This package owns the mechanism, not the application. That distinction is the whole point.
 
@@ -126,7 +126,7 @@ Those responsibilities belong elsewhere. The installer stays small because that 
 
 ## Relationship to other CitOmni packages
 
-CitOmni separates project creation, dependency management, runtime packages, scaffold materialization, and developer workflow into distinct layers.
+CitOmni separates project creation, dependency management, runtime packages, scaffold materialization, and project tooling into distinct layers.
 
 Within that model:
 
@@ -134,7 +134,7 @@ Within that model:
 2. Composer installs and updates packages.
 3. Runtime packages such as `citomni/http` and `citomni/cli` own their own scaffold stubs.
 4. `citomni/installer` materializes package-owned scaffold into the application layer.
-5. `citomni/devkit` may orchestrate a richer developer workflow around project creation, GitHub, secrets, deployment, and registration.
+5. External project tooling may orchestrate richer workflows around project creation, repository setup, secrets, deployment, and registration.
 
 A minimal HTTP application can therefore start from a neutral skeleton, require `citomni/http`, and then materialize only the HTTP-owned files needed by that mode.
 
@@ -261,6 +261,12 @@ composer require citomni/http
 vendor/bin/citomni-installer install --package=citomni/http
 ```
 
+If the installed scaffold uses placeholders such as `{{ CITOMNI_ENVIRONMENT }}`, provide them either through `config/citomni_installer.php` or through repeated `--placeholder=KEY=VALUE` options before running `install`.
+
+```bash
+vendor/bin/citomni-installer install --package=citomni/http --placeholder=CITOMNI_ENVIRONMENT=dev
+```
+
 ### Add CLI support
 
 ```bash
@@ -379,6 +385,15 @@ Example:
 vendor/bin/citomni-installer install --package=citomni/http
 ```
 
+Forced replacement:
+
+```bash
+vendor/bin/citomni-installer install --package=citomni/http --force
+vendor/bin/citomni-installer install --package=citomni/http --force=yes
+```
+
+`--force` allows existing scaffold targets to be overwritten, but asks for interactive confirmation before writing. `--force=yes` confirms the overwrite without prompting and is intended for scripts or explicitly confirmed manual runs. Forced replacements create backups before writing.
+
 ### `repair`
 
 Recreates missing scaffold files from the currently installed package stubs.
@@ -407,13 +422,22 @@ Default behavior:
 - Updates files that still match the previous rendered baseline.
 - Does not overwrite locally modified files.
 - Writes the new upstream version to `.new` when a local modification blocks automatic sync.
-- Does not automatically update `create-only` files.
+- Does not update existing `create-only` files by default; forced replacement requires `--force` or `--force=yes`.
 
 Example:
 
 ```bash
 vendor/bin/citomni-installer sync --package=citomni/http
 ```
+
+Forced sync:
+
+```bash
+vendor/bin/citomni-installer sync public/index.php --package=citomni/http --force
+vendor/bin/citomni-installer sync public/index.php --package=citomni/http --force=yes
+```
+
+`--force` replaces the existing target after interactive confirmation and writes a backup first. `--force=yes` performs the same forced replacement without prompting. A positional target limits the run to that app-relative file; without a target, the command applies to the selected package scope.
 
 Conflict example:
 
@@ -576,10 +600,12 @@ Examples:
 
 ```text
 {{APP_NAMESPACE}}
-{{APP_NAME}}
+{{ APP_NAME }}
 {{CITOMNI_ENVIRONMENT}}
-{{PACKAGE_VERSION}}
+{{ CITOMNI_ENVIRONMENT }}
 ```
+
+Whitespace immediately inside the braces is ignored, but placeholder names themselves must still use uppercase keys matching `[A-Z][A-Z0-9_]*`.
 
 MVP placeholder rules:
 
@@ -677,18 +703,20 @@ Default behavior is conservative.
 | Target exists and is unknown | Stop or write `.new` |
 | Target matches previous `rendered_checksum` | Update if policy is `managed` |
 | Target is locally modified | Do not overwrite |
-| Target is `create-only` and exists | Do not touch |
+| Target is `create-only` and exists | Do not touch unless explicitly forced |
 | Target is outside app root | Fail |
 | Source is missing in package | Fail |
 | Manifest is invalid | Fail |
 | State is unknown or unsafe | Fail without writing |
 
-When `--force` is used to overwrite a file, the installer must create a backup first.
+Plain `--force` asks for confirmation before destructive writes. `--force=yes` confirms the same destructive write without prompting. Both modes create backups before replacing existing files.
+
+When forced replacement overwrites a file, the installer must create a backup first.
 
 Recommended backup location:
 
 ```text
-var/backups/citomni-installer/YYYY-MM-DD-HHMMSS/path/to/file
+var/backups/citomni-installer/<utc-timestamp>/path/to/file
 ```
 
 Writes should be atomic where practical. Scaffold files, `.new` files, backups, and state should be written through a temporary file in the same directory and then renamed into place.
@@ -697,9 +725,9 @@ Writes should be atomic where practical. Scaffold files, `.new` files, backups, 
 
 ## Exit codes
 
-CLI exit codes should be stable so DevKit, CI, and deploy scripts can make deterministic decisions.
+CLI exit codes should be stable so project tooling, CI, and deploy scripts can make deterministic decisions.
 
-Recommended codes:
+Exit codes:
 
 | Code | Meaning |
 |---:|---|
@@ -730,7 +758,9 @@ Example:
 vendor/bin/citomni-installer status --format=json
 ```
 
-JSON output should be stable enough for DevKit and automation. It should include package name, type, policy, target, status, reason, and whether sync is possible without conflict.
+JSON output should be stable enough for project tooling and automation. It should include package name, type, policy, target, status, reason, and whether sync is possible without conflict.
+
+Interactive confirmation is not available in JSON mode. When a forced overwrite is required, automation must use `--force=yes`; plain `--force --format=json` returns an invalid-usage response instead of prompting.
 
 Reason values should distinguish at least:
 
@@ -746,25 +776,25 @@ Human output can be friendly. JSON output should be boring. Boring is a feature 
 
 ---
 
-## DevKit integration
+## Tooling integration
 
-`citomni/devkit` can use `citomni/installer` as the scaffold engine in a larger app-creation workflow.
+External project tooling can use `citomni/installer` as the scaffold engine in a larger app-creation workflow.
 
-A typical DevKit flow may look like this:
+A typical project-tooling flow may look like this:
 
 ```text
-Create app in DevKit
+Create application workspace
 	composer create-project citomni/app-skeleton <path>
 	composer require citomni/http and/or citomni/cli
 	vendor/bin/citomni-installer install --package=citomni/http
 	vendor/bin/citomni-installer install --package=citomni/cli
-	Create GitHub repository
+	Create project repository
 	Push initial commit
-	Register app in DevKit DB
+	Register the application in external tooling
 	Create deployment and secret placeholders
 ```
 
-DevKit should not need to know the internal contents of `public/index.php`, `bin/citomni`, HTTP config stubs, or CLI config stubs. It should ask the installer for status or ask the installer to materialize the package-owned scaffold.
+Project tooling should not need to know the internal contents of `public/index.php`, `bin/citomni`, HTTP config stubs, or CLI config stubs. It should ask the installer for status or ask the installer to materialize the package-owned scaffold.
 
 ---
 
