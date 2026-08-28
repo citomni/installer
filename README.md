@@ -15,7 +15,7 @@ In practical terms, `citomni/installer` lets CitOmni keep `citomni/app-skeleton`
 - **Official scaffold lifecycle tool for CitOmni** with explicit ownership of scaffold discovery, rendering, planning, status, repair, sync, and state.
 - **Composer-native model** where scaffold files come from the currently installed package versions, not from live GitHub fetches or mutable remote templates.
 - **Neutral app skeleton support** so `citomni/app-skeleton` can remain a thin application container instead of a pile of mode-specific runtime files.
-- **Conservative write behavior** with no blind overwrites, `.new` files for blocked upstream updates, confirmation before plain forced replacement, and backups before overwriting existing files.
+- **Conservative write behavior** with no blind overwrites, `.new` files for locally modified managed targets during sync, confirmation before plain forced replacement, and backups before forced overwrites.
 - **Stateful managed-file sync** using both raw stub checksums and rendered-file checksums to separate upstream scaffold drift from local changes.
 - **Bootstrap-independent CLI** through `vendor/bin/citomni-installer`, without requiring `citomni/cli`, `citomni/http`, or a running CitOmni application.
 - **Stable JSON output** for project tooling, CI, deploy hooks, and other automation that needs machine-readable scaffold status.
@@ -64,7 +64,7 @@ No smoke, no mirrors, and preferably no wizard hat in production.
 - `doctor` for read-only environment validation.
 - `status` for read-only scaffold status.
 - `install` for first-time package scaffold materialization.
-- `repair` for recreating missing scaffold files from the currently installed package version.
+- `repair` for recreating missing scaffold files from recorded state using the currently installed package stub and the recorded placeholder snapshot.
 - `sync` for controlled updates of managed scaffold files.
 
 Post-MVP may add `diff` for comparing local files against the current rendered upstream version.
@@ -210,13 +210,13 @@ Examples:
 - `bin/citomni` comes from `citomni/cli`.
 - `config/citomni_installer.php` may be added by the app to provide versioned placeholder configuration when scaffold placeholders are needed.
 
-After `composer create-project`, root-level files are app-owned. `citomni/installer` must not rewrite the app README, `.gitignore`, `composer.json`, or `composer.lock` during normal operation.
+After `composer create-project`, root-level files are app-owned. `citomni/installer` has no separate root-file mutation path: it writes only targets declared by discovered scaffold manifests. App-owned files such as `README.md`, `.gitignore`, `composer.json`, and `composer.lock` should therefore not be declared as package-owned scaffold targets.
 
 ---
 
 ## Requirements
 
-- PHP **8.2+**
+- PHP **8.5+**
 - Composer autoloading
 - `ext-json` for JSON output
 
@@ -296,7 +296,7 @@ vendor/bin/citomni-installer sync --package=citomni/http
 vendor/bin/citomni-installer repair --package=citomni/http
 ```
 
-`repair` is not historical restore. It recreates missing scaffold files from the currently installed package version.
+`repair` is not historical restore. It recreates only missing targets that already have recorded installer state, using the currently installed package stub together with the placeholder snapshot stored in that state.
 
 ---
 
@@ -396,15 +396,17 @@ vendor/bin/citomni-installer install --package=citomni/http --force=yes
 
 ### `repair`
 
-Recreates missing scaffold files from the currently installed package stubs.
+Recreates missing scaffold files from recorded installer state and the currently installed package stubs.
 
 Default behavior:
 
 - Writes only files that are missing.
 - Does not overwrite existing files.
-- Uses previously registered placeholder values when state exists.
+- Requires recorded installer state with a placeholder snapshot for the missing target; without it, the target is left untouched.
+- Uses the recorded placeholder snapshot rather than current `config/citomni_installer.php` or CLI placeholder overrides for the recreated file.
 - Updates the baseline for files it recreates.
 - Reports `recreated_stub_drift` when the recorded stub checksum differs from the currently installed package stub.
+- Ignores `--force`; existing files are never touched by `repair`.
 
 Example:
 
@@ -421,7 +423,8 @@ Default behavior:
 - Creates missing scaffold files, including missing `managed` and `create-only` targets.
 - Updates files that still match the previous rendered baseline.
 - Does not overwrite locally modified files.
-- Writes the new upstream version to `.new` when a local modification blocks automatic sync.
+- Writes the current rendered scaffold to `.new` when a local modification blocks automatic sync.
+- Adopts an unknown existing managed file into state without rewriting it when its bytes exactly match the current rendered scaffold.
 - Does not update existing `create-only` files by default; forced replacement requires `--force` or `--force=yes`.
 
 Example:
@@ -443,7 +446,7 @@ Conflict example:
 
 ```text
 public/index.php changed locally and was not overwritten.
-New upstream version written to public/index.php.new
+Current rendered scaffold written to public/index.php.new
 Review public/index.php and public/index.php.new before merging manually.
 ```
 
@@ -569,8 +572,8 @@ Rules:
 
 - May be updated automatically when the local file still matches the previous rendered baseline.
 - Must not be overwritten when locally modified.
-- Should store both `stub_checksum` and `rendered_checksum` in state.
-- Should produce `.new` when an upstream update is available but local changes block automatic sync.
+- Stores both `stub_checksum` and `rendered_checksum` in state.
+- Produces `.new` during `sync` when local changes block automatic replacement.
 
 ### `create-only`
 
@@ -585,7 +588,7 @@ Examples:
 Rules:
 
 - Create if missing.
-- Register in state.
+- Register newly created files in state.
 - Do not update automatically.
 - Do not treat upstream drift as an automatic update signal.
 - Require explicit force or manual action for replacement.
@@ -617,7 +620,7 @@ MVP placeholder rules:
 - Resolve placeholders from deterministic sources.
 - Store the actual placeholder snapshot used for each rendered file in installer state.
 
-When scaffold placeholders are needed, the application-level placeholder config should live here:
+The installer reads application-level placeholder configuration from this fixed path when the file exists:
 
 ```text
 config/citomni_installer.php
@@ -639,9 +642,9 @@ return [
 ];
 ```
 
-MVP placeholder priority:
+Placeholder precedence, from highest to lowest:
 
-1. CLI options.
+1. CLI `--placeholder=KEY=VALUE` options.
 2. `config/citomni_installer.php`.
 
 Future versions may add Composer metadata, existing CitOmni config, or explicit package defaults.
@@ -660,7 +663,7 @@ vendor/bin/citomni-installer install --package=citomni/http --placeholder=APP_NA
 
 Installer state is stored in the application, not in the installer package, runtime package, or `/vendor/`.
 
-Recommended location:
+The state path is fixed:
 
 ```text
 var/state/citomni/installer-scaffold.php
@@ -700,8 +703,8 @@ Default behavior is conservative.
 | Situation | Default behavior |
 |---|---|
 | Target is missing | Create file |
-| Target exists and is unknown | Stop or write `.new` |
-| Target matches previous `rendered_checksum` | Update if policy is `managed` |
+| Managed target exists but has no state | `install` reports a conflict; `sync` adopts an exact current rendered match, otherwise writes `.new` unless forced |
+| Managed target matches previous `rendered_checksum` | Leave unchanged if it also matches the current render; otherwise update to the current render |
 | Target is locally modified | Do not overwrite |
 | Target is `create-only` and exists | Do not touch unless explicitly forced |
 | Target is outside app root | Fail |
@@ -713,19 +716,19 @@ Plain `--force` asks for confirmation before destructive writes. `--force=yes` c
 
 When forced replacement overwrites a file, the installer must create a backup first.
 
-Recommended backup location:
+Forced-overwrite backups are stored under:
 
 ```text
 var/backups/citomni-installer/<utc-timestamp>/path/to/file
 ```
 
-Writes should be atomic where practical. Scaffold files, `.new` files, backups, and state should be written through a temporary file in the same directory and then renamed into place.
+Scaffold files, `.new` files, backups, and state are written through temporary files and renamed into place.
 
 ---
 
 ## Exit codes
 
-CLI exit codes should be stable so project tooling, CI, and deploy scripts can make deterministic decisions.
+CLI exit codes are defined explicitly so project tooling, CI, and deploy scripts can make deterministic decisions.
 
 Exit codes:
 
@@ -894,7 +897,7 @@ Silent fallback behavior feels nice until it quietly edits the wrong file. That 
 
 ## Contributing
 
-- PHP 8.2+
+- PHP 8.5+
 - PSR-4
 - Tabs for indentation
 - K&R brace style
