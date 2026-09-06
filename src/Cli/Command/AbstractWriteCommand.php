@@ -19,8 +19,8 @@ use CitOmni\Installer\Cli\InstallerCli;
 use CitOmni\Installer\Enum\ExitCode;
 use CitOmni\Installer\Operation\ApplyScaffoldPlan;
 use CitOmni\Installer\Operation\BuildScaffoldPlan;
-use CitOmni\Installer\Support\ComposerPackageLocator;
 use CitOmni\Installer\Support\PlaceholderResolver;
+use CitOmni\Installer\Support\ScaffoldManifestLocator;
 use CitOmni\Installer\Exception\InstallerException;
 
 /**
@@ -54,7 +54,7 @@ use CitOmni\Installer\Exception\InstallerException;
 abstract class AbstractWriteCommand {
 
 	public function __construct(
-		private readonly ComposerPackageLocator $locator,
+		private readonly ScaffoldManifestLocator $locator,
 		private readonly BuildScaffoldPlan $builder,
 		private readonly ApplyScaffoldPlan $applier,
 		private readonly PlaceholderResolver $placeholders

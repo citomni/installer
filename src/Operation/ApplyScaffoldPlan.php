@@ -15,6 +15,7 @@ declare(strict_types=1);
 
 namespace CitOmni\Installer\Operation;
 
+use CitOmni\Installer\Support\AtomicFileWriter;
 use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\ScaffoldRenderer;
 use CitOmni\Installer\State\ScaffoldState;
@@ -76,9 +77,8 @@ use CitOmni\Installer\Exception\InstallerException;
  *   historical bytes; it only renders the current stub forward.
  * - Line endings are whatever the stub ships (LF, pinned via .gitattributes upstream);
  *   the renderer does not alter them and neither does the writer.
- * - The atomic-write/ensure-dir logic intentionally mirrors ScaffoldState. Extracting a
- *   shared Support\AtomicFileWriter used by both would remove the duplication; that is a
- *   separate refactor and is left out of this file's scope.
+ * - The atomic-write/ensure-dir logic lives in Support\AtomicFileWriter, shared with
+ *   ScaffoldState so both go through one temp+fsync+rename implementation.
  *
  * @see \CitOmni\Installer\Operation\BuildScaffoldPlan  Produces the plan consumed here.
  */
@@ -86,9 +86,6 @@ final class ApplyScaffoldPlan {
 
 	/** Namespace segment under var/backups/ for this installer's backups. */
 	private const BACKUP_NS = 'citomni-installer';
-
-	/** Prefix for temp files created during atomic writes. */
-	private const TMP_PREFIX = '.citomni-installer.';
 
 	public function __construct(
 		private readonly PathGuard $pathGuard,
@@ -266,7 +263,7 @@ final class ApplyScaffoldPlan {
 		}
 
 		if (!$dryRun) {
-			$this->atomicWrite($targetAbs, $bytes);
+			AtomicFileWriter::write($targetAbs, $bytes);
 		}
 
 		$entry = $base + ['applied' => ($action === 'create' ? 'created' : 'updated')];
@@ -303,7 +300,7 @@ final class ApplyScaffoldPlan {
 		$this->assertPlanFresh($normTarget, $renderedCk, $plannedRendered);
 
 		if (!$dryRun) {
-			$this->atomicWrite($newPath, $bytes);
+			AtomicFileWriter::write($newPath, $bytes);
 		}
 
 		return [
@@ -463,7 +460,7 @@ final class ApplyScaffoldPlan {
 		if ($bytes === false) {
 			throw new InstallerException(\sprintf('Unable to read file for backup: %s', $targetAbs));
 		}
-		$this->atomicWrite($backupAbs, $bytes);
+		AtomicFileWriter::write($backupAbs, $bytes);
 	}
 
 	/**
@@ -471,70 +468,6 @@ final class ApplyScaffoldPlan {
 	 */
 	private function backupRoot(string $ts): string {
 		return $this->pathGuard->appRoot() . '/var/backups/' . self::BACKUP_NS . '/' . $ts;
-	}
-
-
-	// ----------------------------------------------------------------
-	// Low-level atomic IO
-	// ----------------------------------------------------------------
-
-	/**
-	 * Write bytes atomically: temp file in the same dir, fflush/fsync, rename into place.
-	 */
-	private function atomicWrite(string $absPath, string $bytes): void {
-		$dir = \dirname($absPath);
-		$this->ensureDir($dir);
-
-		// random_bytes() throws \Random\RandomException if the CSPRNG is unavailable. Keep the
-		// failure inside this class's exception currency: InstallerException is what the per-file
-		// handler catches and what the command layer maps to an exit code. Letting the native
-		// type escape would bypass both.
-		try {
-			$rand = \bin2hex(\random_bytes(8));
-		} catch (\Throwable $e) {
-			throw new InstallerException(\sprintf('Unable to generate a temp file name (CSPRNG unavailable) in: %s', $dir), 0, $e);
-		}
-
-		$tmp    = $dir . '/' . self::TMP_PREFIX . $rand . '.tmp';
-		$handle = \fopen($tmp, 'wb');
-		if ($handle === false) {
-			throw new InstallerException(\sprintf('Unable to open temp file for writing: %s', $tmp));
-		}
-		try {
-			$written = \fwrite($handle, $bytes);
-			if ($written === false || $written !== \strlen($bytes)) {
-				throw new InstallerException(\sprintf('Failed to write complete temp file: %s', $tmp));
-			}
-			\fflush($handle);
-			if (\function_exists('fsync')) {
-				@\fsync($handle);
-			}
-		} catch (\Throwable $e) {
-			\fclose($handle);
-			@\unlink($tmp);
-			throw $e instanceof InstallerException ? $e : new InstallerException(\sprintf('Failed writing temp file: %s', $tmp), 0, $e);
-		}
-		\fclose($handle);
-
-		if (!@\rename($tmp, $absPath)) {
-			@\unlink($tmp);
-			throw new InstallerException(\sprintf('Failed to move file into place atomically: %s', $absPath));
-		}
-		if (\function_exists('opcache_invalidate')) {
-			@\opcache_invalidate($absPath, true);
-		}
-	}
-
-	/**
-	 * Create a directory (recursively) if it does not already exist.
-	 */
-	private function ensureDir(string $dir): void {
-		if (\is_dir($dir)) {
-			return;
-		}
-		if (!\mkdir($dir, 0775, true) && !\is_dir($dir)) {
-			throw new InstallerException(\sprintf('Unable to create directory: %s', $dir));
-		}
 	}
 
 

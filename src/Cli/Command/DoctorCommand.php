@@ -18,9 +18,9 @@ namespace CitOmni\Installer\Cli\Command;
 use CitOmni\Installer\Cli\InstallerCli;
 use CitOmni\Installer\Enum\ExitCode;
 use CitOmni\Installer\State\ScaffoldState;
-use CitOmni\Installer\Support\ComposerPackageLocator;
 use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\PlaceholderResolver;
+use CitOmni\Installer\Support\ScaffoldManifestLocator;
 use CitOmni\Installer\Exception\InstallerException;
 
 /**
@@ -41,7 +41,7 @@ final class DoctorCommand {
 	public function __construct(
 		private readonly string $appRoot,
 		private readonly PathGuard $pathGuard,
-		private readonly ComposerPackageLocator $locator,
+		private readonly ScaffoldManifestLocator $locator,
 		private readonly ScaffoldState $state,
 		private readonly PlaceholderResolver $placeholders
 	) {}

@@ -71,7 +71,7 @@ use CitOmni\Installer\Exception\InstallerException;
  *   `error`/`fail` closed-set members are reserved for graceful multi-file
  *   reporting, which MVP does not need.
  * - This Operation does NOT discover packages and does NOT resolve placeholders.
- *   The caller (command/adapter) runs ComposerPackageLocator + placeholder
+ *   The caller (command/adapter) runs ScaffoldManifestLocator + placeholder
  *   resolution (contract §4/§7) and passes the results in. This keeps the
  *   decision graph free of discovery IO and trivially testable.
  */

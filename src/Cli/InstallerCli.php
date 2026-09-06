@@ -24,9 +24,9 @@ use CitOmni\Installer\Enum\ExitCode;
 use CitOmni\Installer\Operation\ApplyScaffoldPlan;
 use CitOmni\Installer\Operation\BuildScaffoldPlan;
 use CitOmni\Installer\State\ScaffoldState;
-use CitOmni\Installer\Support\ComposerPackageLocator;
 use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\PlaceholderResolver;
+use CitOmni\Installer\Support\ScaffoldManifestLocator;
 use CitOmni\Installer\Support\ScaffoldRenderer;
 use CitOmni\Installer\Exception\InstallerException;
 
@@ -104,7 +104,7 @@ final class InstallerCli {
 			return ExitCode::IO_ERROR->value;
 		}
 
-		$locator = ComposerPackageLocator::forAppRoot($appRoot);
+		$locator = ScaffoldManifestLocator::forAppRoot($appRoot);
 		$state   = ScaffoldState::forAppRoot($appRoot);
 
 		// -- 4. Dispatch ----------------------------------------------

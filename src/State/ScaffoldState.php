@@ -16,14 +16,15 @@ declare(strict_types=1);
 namespace CitOmni\Installer\State;
 
 use CitOmni\Installer\Exception\InstallerException;
+use CitOmni\Installer\Support\AtomicFileWriter;
 
 /**
  * Reads and writes the app-local installer state file (contract §5).
  *
  * The state file is a plain PHP file that `return`s an array; it is NOT a Repository
  * and involves no SQL. This class owns the file envelope (format_version, generated_by,
- * generated_at) and the low-level atomic write; the `packages` payload is domain data
- * supplied by the caller (ApplyScaffoldPlan).
+ * generated_at) and delegates the low-level atomic write to Support\AtomicFileWriter; the
+ * `packages` payload is domain data supplied by the caller (ApplyScaffoldPlan).
  *
  * Safety model:
  * - format_version is validated on every read. A file whose version this installer
@@ -34,10 +35,10 @@ use CitOmni\Installer\Exception\InstallerException;
  *   so a downgrade can never destroy a newer installer's state.
  *
  * Atomic write (§5):
- * - Render to a temp file in the SAME directory, flush, best-effort fsync when
- *   available, then rename
- *   over the target. rename() is atomic on POSIX and modern Windows when both paths are
- *   on the same filesystem (guaranteed by writing the temp file beside the target).
+ * - Delegated to Support\AtomicFileWriter: temp file in the SAME directory, flush,
+ *   best-effort fsync when available, then rename over the target. rename() is atomic on
+ *   POSIX and modern Windows when both paths are on the same filesystem (guaranteed by
+ *   writing the temp file beside the target).
  *
  * Notes:
  * - App-aware (knows the app-relative location), instantiated explicitly. Not a service.
@@ -171,7 +172,7 @@ final class ScaffoldState {
 			. " */\n\n"
 			. 'return ' . \var_export($state, true) . ";\n";
 
-		$this->atomicWrite($code);
+		AtomicFileWriter::write($this->path, $code);
 	}
 
 
@@ -239,74 +240,6 @@ final class ScaffoldState {
 		}
 
 		return $data;
-	}
-
-
-	/**
-	 * Atomically write rendered PHP to the state path (temp + fsync + rename).
-	 *
-	 * @param  string $code  Full PHP file contents to write.
-	 * @return void
-	 * @throws InstallerException
-	 */
-	private function atomicWrite(string $code): void {
-		$dir = \dirname($this->path);
-		$this->ensureDir($dir);
-
-		// Temp file lives in the same directory so rename() stays on one filesystem.
-		$tmp    = $dir . '/.installer-scaffold.' . \bin2hex(\random_bytes(8)) . '.tmp';
-		$handle = \fopen($tmp, 'wb');
-		if ($handle === false) {
-			throw new InstallerException(\sprintf('Unable to open temp state file for writing: %s', $tmp));
-		}
-
-		try {
-			$written = \fwrite($handle, $code);
-			if ($written === false || $written !== \strlen($code)) {
-				throw new InstallerException(\sprintf('Failed to write complete temp state file: %s', $tmp));
-			}
-
-			\fflush($handle);
-			// Best-effort durability; not every filesystem supports fsync.
-			if (\function_exists('fsync')) {
-				@\fsync($handle);
-			}
-		} catch (\Throwable $e) {
-			\fclose($handle);
-			@\unlink($tmp);
-			throw $e instanceof InstallerException
-				? $e
-				: new InstallerException(\sprintf('Failed writing temp state file: %s', $tmp), 0, $e);
-		}
-
-		\fclose($handle);
-
-		if (!@\rename($tmp, $this->path)) {
-			@\unlink($tmp);
-			throw new InstallerException(\sprintf('Failed to move state file into place atomically: %s', $this->path));
-		}
-
-		if (\function_exists('opcache_invalidate')) {
-			@\opcache_invalidate($this->path, true);
-		}
-	}
-
-
-	/**
-	 * Create a directory (recursively) if it does not already exist.
-	 *
-	 * @param  string $dir
-	 * @return void
-	 * @throws InstallerException
-	 */
-	private function ensureDir(string $dir): void {
-		if (\is_dir($dir)) {
-			return;
-		}
-
-		if (!\mkdir($dir, 0775, true) && !\is_dir($dir)) {
-			throw new InstallerException(\sprintf('Unable to create state directory: %s', $dir));
-		}
 	}
 
 
