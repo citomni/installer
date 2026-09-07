@@ -35,9 +35,8 @@ namespace CitOmni\Installer\Util;
  *
  * Notes:
  * - Pure utility: no IO, no App, no state.
- * - Containment is byte-exact and case-sensitive; on case-insensitive filesystems the
- *   caller resolves via realpath first, which canonicalizes both operands consistently.
- *   No platform-specific complexity is added in MVP (§5).
+ * - Containment is case-sensitive by default. PathGuard requests case-insensitive
+ *   comparison on Windows, including for path segments that do not exist yet.
  */
 final class Path {
 
@@ -225,11 +224,16 @@ final class Path {
 	 *
 	 * @param  string $base  Resolved absolute base directory (app-root or package-root).
 	 * @param  string $path  Resolved absolute candidate path.
+	 * @param  bool $caseInsensitive Fold ASCII case for Windows path comparisons.
 	 * @return bool          True iff $path equals $base or sits beneath it.
 	 */
-	public static function isInside(string $base, string $path): bool {
+	public static function isInside(string $base, string $path, bool $caseInsensitive = false): bool {
 		$base = \rtrim(\str_replace('\\', '/', $base), '/');
 		$path = \rtrim(\str_replace('\\', '/', $path), '/');
+		if ($caseInsensitive) {
+			$base = \strtolower($base);
+			$path = \strtolower($path);
+		}
 
 		if ($base === '') {
 			return false;

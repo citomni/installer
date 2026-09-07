@@ -20,6 +20,7 @@ use CitOmni\Installer\State\ScaffoldState;
 use CitOmni\Installer\Util\Checksum;
 use CitOmni\Installer\Util\Path;
 use CitOmni\Installer\Exception\InstallerException;
+use CitOmni\Installer\Exception\FilesystemException;
 
 /**
  * Builds the scaffold decision graph for status/install/sync/repair (contract §6-§10).
@@ -81,7 +82,7 @@ final class BuildScaffoldPlan {
 	 * Commands that produce a plan. `doctor` is read-only validation and does
 	 * not flow through here.
 	 */
-	private const COMMANDS = ['status', 'install', 'sync', 'repair'];
+	private const COMMANDS = ['status', 'install', 'sync', 'repair', 'environment'];
 
 	public function __construct(private readonly PathGuard $pathGuard, private readonly ScaffoldRenderer $renderer, private readonly ScaffoldState $state) {}
 
@@ -93,14 +94,15 @@ final class BuildScaffoldPlan {
 	/**
 	 * Build the plan for a command across the given (already discovered) manifests.
 	 *
-	 * @param  string                            $command       One of status|install|sync|repair.
+	 * @param  string                            $command       One of status|install|sync|repair|environment.
 	 * @param  array<string,array<string,mixed>> $manifests     Keyed by package name. Each manifest:
 	 *                                                           ['package'=>string,'version'=>int,
 	 *                                                            'root'=>absolute-package-root,
 	 *                                                            'files'=>list<['target','source','type','policy']>].
 	 * @param  array<string,array<string,string>> $placeholders Resolved placeholders keyed by package
 	 *                                                           name (PACKAGE_VERSION etc. already resolved per §7).
-	 * @param  array<string,mixed>               $options       ['force'=>bool, 'target'=>?string single-file scope].
+	 * @param  array<string,mixed>               $options       ['force'=>bool, 'target'=>?string single-file scope,
+	 *                                                           'environment_materialization'=>bool].
 	 * @return array<string,mixed>               The plan (arrays only).
 	 * @throws InstallerException  On unknown command, unsafe path, missing source, or unsafe state.
 	 */
@@ -111,6 +113,7 @@ final class BuildScaffoldPlan {
 		}
 
 		$force = (bool)($options['force'] ?? false);
+		$environmentMaterialization = (bool)($options['environment_materialization'] ?? false);
 		$scope = (isset($options['target']) && \is_string($options['target']) && $options['target'] !== '')
 			? Path::normalizeRelative($options['target'])
 			: null;
@@ -130,7 +133,7 @@ final class BuildScaffoldPlan {
 
 			$files = [];
 			foreach ((array)($manifest['files'] ?? []) as $file) {
-				$entry = $this->planFile($command, $packageRoot, (array)$file, $pkgPlaceholders, $pkgState, $force, $scope);
+				$entry = $this->planFile($command, $packageRoot, (array)$file, $pkgPlaceholders, $pkgState, $force, $scope, $environmentMaterialization);
 				if ($entry !== null) {
 					$files[] = $entry;
 				}
@@ -162,11 +165,12 @@ final class BuildScaffoldPlan {
 	 * @return array<string,mixed>|null  Plan entry, or null when filtered out by single-file scope.
 	 * @throws InstallerException        On unsafe path, missing source, or unreadable target.
 	 */
-	private function planFile(string $command, string $packageRoot, array $file, array $pkgPlaceholders, array $pkgState, bool $force, ?string $scope): ?array {
+	private function planFile(string $command, string $packageRoot, array $file, array $pkgPlaceholders, array $pkgState, bool $force, ?string $scope, bool $environmentMaterialization): ?array {
 		$target = (string)($file['target'] ?? '');
 		$source = (string)($file['source'] ?? '');
 		$type   = (string)($file['type'] ?? '');
 		$policy = (string)($file['policy'] ?? '');
+		$environmentAware = !empty($file['_environment_aware']);
 
 		if ($target === '' || $source === '' || $policy === '') {
 			throw new InstallerException('Manifest file entry is missing target, source, or policy.');
@@ -191,6 +195,9 @@ final class BuildScaffoldPlan {
 			throw new InstallerException("Scaffold source missing in package: '{$source}'.");
 		}
 
+		if (\file_exists($targetAbs) && !\is_file($targetAbs)) {
+			throw new FilesystemException('Scaffold target is not a regular file: ' . $normTarget);
+		}
 		$exists    = \is_file($targetAbs);
 		$stateFile = \is_array($pkgState['files'][$normTarget] ?? null) ? $pkgState['files'][$normTarget] : null;
 
@@ -210,7 +217,7 @@ final class BuildScaffoldPlan {
 			} else {
 				$disk = \file_get_contents($targetAbs);
 				if ($disk === false) {
-					throw new InstallerException("Cannot read target for drift detection: '{$normTarget}'.");
+					throw new FilesystemException("Cannot read target for drift detection: '{$normTarget}'.");
 				}
 
 				if ($stateFile === null) {
@@ -248,7 +255,7 @@ final class BuildScaffoldPlan {
 		}
 
 		// -- 2. Decide action -------------------------------------------------
-		$decision = $this->decide($command, $policy, $status, $force, [
+		$decision = $this->decide($command, $policy, $status, $force, $environmentAware, $environmentMaterialization, [
 			'targetAbs'       => $targetAbs,
 			'sourceAbs'       => $sourceAbs,
 			'normTarget'      => $normTarget,
@@ -257,6 +264,9 @@ final class BuildScaffoldPlan {
 			'stateFile'       => $stateFile,
 			'disk'            => $disk,
 			'currentCk'       => $currentCk,
+			'exists'          => $exists,
+			'type'            => $type,
+			'policy'          => $policy,
 		]);
 
 		// -- 3. Assemble entry (public fields in DevKit order, then internal) -
@@ -290,13 +300,16 @@ final class BuildScaffoldPlan {
 	 * @param  array<string,mixed> $ctx  Per-file working context (paths, placeholders, state, disk, cached checksums).
 	 * @return array<string,mixed>       ['action'=>string, 'reason'?=>string, 'backup'?=>bool, 'apply'?=>array].
 	 */
-	private function decide(string $command, string $policy, string $status, bool $force, array $ctx): array {
+	private function decide(string $command, string $policy, string $status, bool $force, bool $environmentAware, bool $environmentMaterialization, array $ctx): array {
 		switch ($command) {
 			case 'status':
 				// Read-only report: status carries the meaning, action is inert.
 				return ['action' => 'none'];
 
 			case 'install':
+				if ($environmentMaterialization && $environmentAware) {
+					return $this->decideInitialEnvironment($status, $ctx);
+				}
 				return $this->decideInstall($status, $force, $ctx);
 
 			case 'sync':
@@ -304,6 +317,9 @@ final class BuildScaffoldPlan {
 
 			case 'repair':
 				return $this->decideRepair($status, $ctx);
+
+			case 'environment':
+				return $this->decideEnvironment($status, $ctx);
 		}
 
 		// Unreachable: build() validated the command up front.
@@ -324,12 +340,136 @@ final class BuildScaffoldPlan {
 			return $this->forceOverwrite($ctx);
 		}
 
+		if ($status === 'create_only_present' && $ctx['stateFile'] === null) {
+			$stub = $this->renderer->readStub($ctx['sourceAbs']);
+			foreach ($this->renderer->placeholdersIn($stub) as $key) {
+				if (!\array_key_exists($key, $ctx['pkgPlaceholders'])) {
+					return ['action' => 'none'];
+				}
+			}
+			$rendered = $this->renderer->render($stub, $ctx['pkgPlaceholders']);
+			$disk = \file_get_contents($ctx['targetAbs']);
+			if ($disk === false) {
+				throw new FilesystemException('Cannot read create-only target: ' . $ctx['normTarget']);
+			}
+			if ($disk !== $rendered) {
+				return ['action' => 'none'];
+			}
+			$ctx['disk'] = $disk;
+			return [
+				'action' => 'register_state',
+				'reason' => 'adopt_clean_baseline',
+				'apply' => $this->applyState($ctx, $ctx['pkgPlaceholders'], [Checksum::sha256($stub), Checksum::sha256($rendered)]),
+			];
+		}
+
 		if ($status === 'unknown_existing' || $status === 'local_modified') {
+			$ck = $ctx['currentCk'] ?? $this->render($ctx['sourceAbs'], $ctx['pkgPlaceholders']);
+			if (Checksum::matches((string)$ctx['disk'], $ck[1])) {
+				return [
+					'action' => 'register_state',
+					'reason' => 'adopt_clean_baseline',
+					'apply' => $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck),
+				];
+			}
 			return ['action' => 'conflict', 'reason' => $status];
 		}
 
 		return ['action' => 'none'];
 	}
+
+
+	/**
+	 * Initial environment materialization compatibility gate.
+	 *
+	 * Existing environment-aware targets may be adopted only when their current
+	 * bytes already equal the desired rendering. A different environment is a
+	 * conflict even when --force was supplied; switching belongs to `environment`.
+	 *
+	 * @param array<string,mixed> $ctx
+	 * @return array<string,mixed>
+	 */
+	private function decideInitialEnvironment(string $status, array $ctx): array {
+		if ($status === 'missing') {
+			return $this->createWith($ctx, $ctx['pkgPlaceholders']);
+		}
+
+		$ck = $ctx['currentCk'] ?? $this->render($ctx['sourceAbs'], $ctx['pkgPlaceholders']);
+		$disk = (string)$ctx['disk'];
+
+		if (!Checksum::matches($disk, $ck[1])) {
+			return [
+				'action' => 'conflict',
+				'reason' => 'different_environment',
+			];
+		}
+
+		if ($this->recordedBaselineMatches($ctx, $ck)) {
+			return ['action' => 'none', 'reason' => 'environment_up_to_date', 'apply' => $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck)];
+		}
+
+		return [
+			'action' => 'register_state',
+			'reason' => 'adopt_environment_baseline',
+			'apply' => $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck),
+		];
+	}
+
+	/**
+	 * Environment switch: desired bytes are authoritative for managed targets.
+	 *
+	 * @param array<string,mixed> $ctx
+	 * @return array<string,mixed>
+	 */
+	private function decideEnvironment(string $status, array $ctx): array {
+		if ($status === 'missing') {
+			return $this->createWith($ctx, $ctx['pkgPlaceholders']);
+		}
+
+		$ck = $ctx['currentCk'] ?? $this->render($ctx['sourceAbs'], $ctx['pkgPlaceholders']);
+		$disk = (string)$ctx['disk'];
+
+		if (Checksum::matches($disk, $ck[1])) {
+			if ($this->recordedBaselineMatches($ctx, $ck)) {
+				return ['action' => 'none', 'reason' => 'environment_up_to_date', 'apply' => $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck)];
+			}
+
+			return [
+				'action' => 'register_state',
+				'reason' => 'adopt_environment_baseline',
+				'apply' => $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck),
+			];
+		}
+
+		$apply = $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck);
+		$apply['backup_required'] = true;
+
+		return [
+			'action' => 'update',
+			'backup' => true,
+			'reason' => 'environment_overwrite',
+			'apply' => $apply,
+		];
+	}
+
+	/**
+	 * Compare the complete reproduction input, even when rendered bytes are equal.
+	 *
+	 * @param array<string,mixed> $ctx Current file context.
+	 * @param array{0:string,1:string} $ck Current stub and rendered checksums.
+	 * @return bool Whether repair can already reproduce the current source/input.
+	 */
+	private function recordedBaselineMatches(array $ctx, array $ck): bool {
+		$stateFile = $ctx['stateFile'];
+		return \is_array($stateFile)
+			&& ($stateFile['source'] ?? null) === $ctx['normSource']
+			&& ($stateFile['type'] ?? null) === $ctx['type']
+			&& ($stateFile['policy'] ?? null) === $ctx['policy']
+			&& ($stateFile['placeholders'] ?? null) === $ctx['pkgPlaceholders']
+			&& Checksum::equals((string)($stateFile['stub_checksum'] ?? ''), $ck[0])
+			&& Checksum::equals((string)($stateFile['rendered_checksum'] ?? ''), $ck[1]);
+	}
+
 
 	/**
 	 * sync: controlled update of managed files; create-only mostly untouched.
@@ -356,7 +496,10 @@ final class BuildScaffoldPlan {
 				return $this->createWith($ctx, $ctx['pkgPlaceholders']);
 
 			case 'up_to_date':
-				return ['action' => 'none'];
+				$ck = $ctx['currentCk'];
+				return $this->recordedBaselineMatches($ctx, $ck)
+					? ['action' => 'none']
+					: ['action' => 'register_state', 'reason' => 'adopt_clean_baseline', 'apply' => $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck)];
 
 			case 'update_available':
 			case 'placeholder_drift':
@@ -476,7 +619,16 @@ final class BuildScaffoldPlan {
 	 * @return array<string,mixed>
 	 */
 	private function applyState(array $ctx, array $placeholders, array $ck): array {
+		$disk = $ctx['disk'];
+		if ($ctx['exists'] && $disk === null) {
+			$disk = \file_get_contents($ctx['targetAbs']);
+			if ($disk === false) {
+				throw new FilesystemException('Cannot snapshot target: ' . $ctx['normTarget']);
+			}
+		}
 		return [
+			'target_exists'     => $ctx['exists'],
+			'target_checksum'   => $ctx['exists'] ? Checksum::sha256($disk) : null,
 			'target'            => $ctx['normTarget'],
 			'source'            => $ctx['normSource'],
 			'target_abs'        => $ctx['targetAbs'],

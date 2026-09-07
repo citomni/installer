@@ -21,15 +21,16 @@ use CitOmni\Installer\Support\ScaffoldRenderer;
 use CitOmni\Installer\State\ScaffoldState;
 use CitOmni\Installer\Util\Checksum;
 use CitOmni\Installer\Exception\InstallerException;
+use CitOmni\Installer\Exception\FilesystemException;
+use CitOmni\Installer\Exception\ConflictException;
 
 /**
- * Execute a scaffold plan: the single layer permitted to mutate app files and state.
+ * Execute scaffold actions, verify plan snapshots, and optionally persist state.
  *
  * BuildScaffoldPlan owns the decision graph and returns a pure array describing what
  * should happen per file. ApplyScaffoldPlan is the only place those decisions become
- * filesystem effects. It performs no detection or policy reasoning of its own; it
- * trusts the plan and limits itself to materializing bytes, writing `.new` sidecars,
- * backing up before forced overwrites, and persisting the state file.
+ * filesystem effects. It verifies planned source/target bytes, materializes files,
+ * writes `.new` sidecars, backs up before replacement, and persists scaffold state.
  *
  * Behavior:
  * - Reads the current state once up front (precondition). If state cannot be read
@@ -47,24 +48,25 @@ use CitOmni\Installer\Exception\InstallerException;
  *        staging a state entry (adopt-clean-baseline). The recorded checksums are the fresh
  *        ones, so an adopted baseline is verified against disk at apply time, not trusted
  *        from plan time.
- *     5) none / conflict -> no write.
+ *     5) none / conflict -> no write. Environment no-ops still verify their snapshots.
  * - Re-resolves every write destination through PathGuard at the write site, so the
  *   "never write outside app-root / never write to /vendor/" invariant is enforced
  *   at the point of mutation, not only at plan time.
- * - Stale-plan guard: re-renders before writing and compares the rendered checksum to
- *   the planned one. A mismatch means the stub (or resolved placeholders) changed
- *   between planning and applying; that file is failed rather than written, so the
- *   recorded rendered_checksum can never disagree with the bytes on disk.
+ * - Stale-plan guards compare the rendered checksum and observed target path,
+ *   existence, and bytes. Changes since planning become per-file conflicts. The CLI
+ *   additionally holds InstallerLock; callers using this engine directly own locking.
+ *   These checks do not provide filesystem transactions against unrelated editors.
  * - State is merged into the existing state (siblings preserved) and written once,
  *   atomically, at the end of a successful run that produced at least one state change.
  *
  * Failure model (deliberate: best-effort with a full report):
- * - A per-file IO/integrity error is caught, recorded as applied = "failed" on that
+ * - A per-file IO/internal error is caught, recorded as applied = "failed" on that
  *   file, and the run continues. This is the right shape for an installer: a single
  *   unwritable file must not abort materialization of the others, and because each
  *   write is independently atomic, partial application is already the reality. State
- *   is still persisted for the files that did succeed, so the recorded baseline always
- *   matches what is actually on disk. Hard preconditions (unreadable/unsafe state) are
+ *   is persisted for successful entries when persist_state is enabled. Environment
+ *   materialization defers that commit until every file and Composer succeeds.
+ *   Stale targets/plans are reported as conflicts. Hard preconditions (unsafe state) are
  *   NOT caught here and propagate so the command layer can map them to exit 5.
  *
  * Atomicity:
@@ -103,7 +105,7 @@ final class ApplyScaffoldPlan {
 	 *
 	 * @param  array  $plan     Plan array: {command, force, packages[]} where each file
 	 *                          carries action/status/policy and an optional `_apply` block.
-	 * @param  array  $options  {dry_run?: bool}. In dry-run, stubs are still rendered and
+	 * @param  array  $options  {dry_run?: bool, persist_state?: bool}. In dry-run, stubs are still rendered and
 	 *                          validated (so problems surface) but nothing is written.
 	 * @return array  Result: {command, dry_run, ok, backup_dir, state_written, packages[]},
 	 *                where each file gains an `applied` outcome (created|updated|wrote_new|
@@ -112,7 +114,8 @@ final class ApplyScaffoldPlan {
 	 *                             or if the final state write fails.
 	 */
 	public function apply(array $plan, array $options = []): array {
-		$dryRun  = (bool)($options['dry_run'] ?? false);
+		$dryRun = (bool)($options['dry_run'] ?? false);
+		$persistState = (bool)($options['persist_state'] ?? true);
 		$command = (string)($plan['command'] ?? '');
 
 		// -- 1. Precondition: existing state must be readable before we touch anything ----
@@ -122,6 +125,22 @@ final class ApplyScaffoldPlan {
 
 		$ts  = $this->timestamp();
 		$now = $this->nowIso8601();
+		$backupReserved = false;
+		if (!$dryRun) {
+			foreach ($plan['packages'] as $package) {
+				foreach ($package['files'] as $file) {
+					if (!empty($file['_apply']['backup_required'])) {
+						$root = $this->pathGuard->resolveTarget('var/backups/' . self::BACKUP_NS . '/' . $ts);
+						// mkdir must create this run's leaf, never reuse an earlier run.
+						if (!@\mkdir($root, 0775, true)) {
+							throw new FilesystemException('Unable to reserve a unique backup directory: ' . $root);
+						}
+						$backupReserved = true;
+						break 2;
+					}
+				}
+			}
+		}
 
 		$resultPackages = [];
 		$stateDirty     = false;
@@ -140,7 +159,7 @@ final class ApplyScaffoldPlan {
 				$resultFiles[] = $entry;
 
 				$applied = (string)($entry['applied'] ?? '');
-				if ($applied === 'failed' || $applied === 'conflict') {
+				if ($applied === 'failed' || $applied === 'conflict' || $applied === 'wrote_new') {
 					$ok = false;
 				}
 				if (isset($entry['backup_path'])) {
@@ -162,19 +181,25 @@ final class ApplyScaffoldPlan {
 
 		// -- 3. Persist state once (only if something actually changed) -------------------
 		$stateWritten = false;
-		if (!$dryRun && $stateDirty) {
-			$this->state->write($statePackages);
+		if (!$dryRun && $persistState && $stateDirty) {
+			$this->state->writePackages($statePackages);
 			$stateWritten = true;
 		}
 
-		return [
+		$result = [
 			'command'       => $command,
 			'dry_run'       => $dryRun,
 			'ok'            => $ok,
-			'backup_dir'    => $anyBackup ? $this->backupRoot($ts) : null,
+			'backup_dir'    => ($anyBackup || $backupReserved) ? $this->backupRoot($ts) : null,
 			'state_written' => $stateWritten,
 			'packages'      => $resultPackages,
 		];
+
+		if (!$persistState) {
+			$result['_state_packages'] = $statePackages;
+		}
+
+		return $result;
 	}
 
 
@@ -199,8 +224,8 @@ final class ApplyScaffoldPlan {
 			'action' => $action,
 		];
 
-		// No-write outcomes carry no `_apply` block.
-		if ($action === 'none') {
+		// Ordinary no-ops have no snapshot; environment no-ops must still be verified.
+		if ($action === 'none' && !isset($file['_apply'])) {
 			return ['entry' => $base + ['applied' => 'skipped'], 'state' => null];
 		}
 		if ($action === 'conflict') {
@@ -214,6 +239,11 @@ final class ApplyScaffoldPlan {
 
 		try {
 			switch ($action) {
+				case 'none':
+					$this->assertTargetFresh($apply);
+					[, $renderedCk] = $this->renderForApply($apply['source_abs'], $apply['placeholders']);
+					$this->assertPlanFresh($apply['target'], $renderedCk, $apply['rendered_checksum']);
+					return ['entry' => $base + ['applied' => 'skipped'], 'state' => null];
 				case 'create':
 				case 'update':
 					return $this->applyWrite($base, $apply, $action, $dryRun, $ts, $now);
@@ -226,7 +256,14 @@ final class ApplyScaffoldPlan {
 			}
 		} catch (InstallerException $e) {
 			// Per-file recoverable failure: report and let the run continue (see class docblock).
-			return ['entry' => $base + ['applied' => 'failed', 'error' => $e->getMessage()], 'state' => null];
+			return [
+				'entry' => $base + [
+					'applied' => $e instanceof ConflictException ? 'conflict' : 'failed',
+					'error_type' => $e instanceof FilesystemException ? 'io' : ($e instanceof ConflictException ? 'conflict' : 'general'),
+					'error' => $e->getMessage(),
+				],
+				'state' => null,
+			];
 		}
 	}
 
@@ -247,7 +284,7 @@ final class ApplyScaffoldPlan {
 		$backupRequired  = !empty($apply['backup_required']);
 
 		// Authoritative write destination, re-validated under app-root at the write site.
-		$targetAbs = $this->pathGuard->resolveTarget($normTarget);
+		$targetAbs = $this->assertTargetFresh($apply);
 
 		// Render forward + guard against a stale plan.
 		[$stubCk, $renderedCk, $bytes] = $this->renderForApply($sourceAbs, $placeholders);
@@ -258,11 +295,12 @@ final class ApplyScaffoldPlan {
 		if ($backupRequired && \is_file($targetAbs)) {
 			$backupPath = $this->backupPathFor($normTarget, $ts);
 			if (!$dryRun) {
-				$this->backupExisting($targetAbs, $backupPath);
+				$this->backupExisting($targetAbs, $backupPath, $apply['target_checksum']);
 			}
 		}
 
 		if (!$dryRun) {
+			$targetAbs = $this->assertTargetFresh($apply);
 			AtomicFileWriter::write($targetAbs, $bytes);
 		}
 
@@ -333,9 +371,9 @@ final class ApplyScaffoldPlan {
 		$plannedRendered = (string)($apply['rendered_checksum'] ?? '');
 
 		// Authoritative path, re-validated under app-root at the (state) write site.
-		$targetAbs = $this->pathGuard->resolveTarget($normTarget);
+		$targetAbs = $this->assertTargetFresh($apply);
 		if (!\is_file($targetAbs)) {
-			throw new InstallerException(\sprintf(
+			throw new ConflictException(\sprintf(
 				"Cannot adopt baseline for '%s': the file no longer exists on disk.",
 				$normTarget
 			));
@@ -348,10 +386,10 @@ final class ApplyScaffoldPlan {
 		// Re-verify the adopt-clean condition against current disk bytes at apply time.
 		$disk = \file_get_contents($targetAbs);
 		if ($disk === false) {
-			throw new InstallerException(\sprintf("Cannot read target for baseline adoption: '%s'.", $normTarget));
+			throw new FilesystemException(\sprintf("Cannot read target for baseline adoption: '%s'.", $normTarget));
 		}
 		if (!Checksum::matches($disk, $renderedCk)) {
-			throw new InstallerException(\sprintf(
+			throw new ConflictException(\sprintf(
 				"Cannot adopt baseline for '%s': disk bytes no longer match the rendered baseline "
 				. '(the file changed since the plan was built). Re-run the plan.',
 				$normTarget
@@ -428,11 +466,51 @@ final class ApplyScaffoldPlan {
 	}
 
 	/**
+	 * Recheck the exact target observed by the plan before writing or adopting it.
+	 *
+	 * @param array<string,mixed> $apply Internal plan snapshot.
+	 * @return string Current guarded absolute target path.
+	 * @throws ConflictException When the target path, existence, or bytes changed.
+	 * @throws FilesystemException When an existing target cannot be read.
+	 */
+	private function assertTargetFresh(array $apply): string {
+		$path = $this->pathGuard->resolveTarget($apply['target']);
+		$plannedPath = \str_replace('\\', '/', $apply['target_abs']);
+		$currentPath = \str_replace('\\', '/', $path);
+		if (\PHP_OS_FAMILY === 'Windows') {
+			$plannedPath = \strtolower($plannedPath);
+			$currentPath = \strtolower($currentPath);
+		}
+		if ($plannedPath !== $currentPath) {
+			throw new ConflictException('Target path changed since planning: ' . $apply['target']);
+		}
+		\clearstatcache(true, $path);
+		if (!$apply['target_exists']) {
+			if (\file_exists($path) || \is_link($path)) {
+				throw new ConflictException('Target appeared since planning: ' . $apply['target']);
+			}
+			return $path;
+		}
+		if (!\is_file($path)) {
+			throw new ConflictException('Target disappeared or changed type since planning: ' . $apply['target']);
+		}
+		$bytes = \file_get_contents($path);
+		if ($bytes === false) {
+			throw new FilesystemException('Unable to read target before apply: ' . $apply['target']);
+		}
+		if (!Checksum::matches($bytes, $apply['target_checksum'])) {
+			throw new ConflictException('Target bytes changed since planning. Re-run the command: ' . $apply['target']);
+		}
+		return $path;
+	}
+
+
+	/**
 	 * Refuse to write when the freshly rendered bytes no longer match the planned baseline.
 	 */
 	private function assertPlanFresh(string $normTarget, string $renderedCk, string $plannedRendered): void {
 		if ($plannedRendered !== '' && !Checksum::equals($renderedCk, $plannedRendered)) {
-			throw new InstallerException(\sprintf(
+			throw new ConflictException(\sprintf(
 				"Plan is stale for '%s': the rendered output no longer matches the planned baseline "
 				. '(the stub or resolved placeholders changed since the plan was built). Re-run the plan.',
 				$normTarget
@@ -455,10 +533,16 @@ final class ApplyScaffoldPlan {
 	/**
 	 * Atomically copy the current bytes of an existing target into the backup tree.
 	 */
-	private function backupExisting(string $targetAbs, string $backupAbs): void {
+	private function backupExisting(string $targetAbs, string $backupAbs, string $expectedChecksum): void {
 		$bytes = \file_get_contents($targetAbs);
 		if ($bytes === false) {
-			throw new InstallerException(\sprintf('Unable to read file for backup: %s', $targetAbs));
+			throw new FilesystemException(\sprintf('Unable to read file for backup: %s', $targetAbs));
+		}
+		if (!Checksum::matches($bytes, $expectedChecksum)) {
+			throw new ConflictException('Target changed while preparing its backup: ' . $targetAbs);
+		}
+		if (\file_exists($backupAbs) || \is_link($backupAbs)) {
+			throw new FilesystemException('Refusing to replace an existing backup: ' . $backupAbs);
 		}
 		AtomicFileWriter::write($backupAbs, $bytes);
 	}
@@ -480,8 +564,8 @@ final class ApplyScaffoldPlan {
 		return (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format(\DateTimeInterface::ATOM);
 	}
 
-	/** Compact, sortable, filesystem-safe UTC stamp for the backup directory name. */
+	/** Filesystem-safe UTC microsecond stamp plus a random suffix; mkdir reserves it. */
 	private function timestamp(): string {
-		return (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Ymd\\THis\\Z');
+		return (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Ymd\\THis.u\\Z') . '-' . \bin2hex(\random_bytes(8));
 	}
 }

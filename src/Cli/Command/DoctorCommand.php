@@ -17,10 +17,12 @@ namespace CitOmni\Installer\Cli\Command;
 
 use CitOmni\Installer\Cli\InstallerCli;
 use CitOmni\Installer\Enum\ExitCode;
+use CitOmni\Installer\Enum\Environment;
 use CitOmni\Installer\State\ScaffoldState;
 use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\ScaffoldManifestLocator;
+use CitOmni\Installer\Support\ComposerRunner;
 use CitOmni\Installer\Exception\InstallerException;
 
 /**
@@ -43,7 +45,8 @@ final class DoctorCommand {
 		private readonly PathGuard $pathGuard,
 		private readonly ScaffoldManifestLocator $locator,
 		private readonly ScaffoldState $state,
-		private readonly PlaceholderResolver $placeholders
+		private readonly PlaceholderResolver $placeholders,
+		private readonly ComposerRunner $composer
 	) {}
 
 	/**
@@ -57,13 +60,28 @@ final class DoctorCommand {
 			return ExitCode::USAGE_ERROR->value;
 		}
 
-		$format  = $parsed['options']['format'];
+		$format = $parsed['options']['format'];
 		$package = $parsed['options']['package'];
+		$explicitEnvironment = null;
+
+		if ($parsed['options']['environment'] !== null) {
+			$explicitEnvironment = Environment::tryFrom($parsed['options']['environment']);
+			if ($explicitEnvironment === null) {
+				\fwrite(\STDERR, \sprintf(
+					"Invalid environment %s. Expected one of: %s.\n",
+					\var_export($parsed['options']['environment'], true),
+					\implode(', ', Environment::values())
+				));
+				return ExitCode::USAGE_ERROR->value;
+			}
+		}
 
 		/** @var list<array{name:string,status:string,detail:string}> $checks */
-		$checks    = [];
+		$checks = [];
 		/** @var list<int> $failCodes */
 		$failCodes = [];
+		$manifests = [];
+		$recordedEnvironment = null;
 
 		// -- 1. app-root (already validated by PathGuard) -------------
 		$checks[] = ['name' => 'app_root', 'status' => 'ok', 'detail' => $this->appRoot];
@@ -137,16 +155,35 @@ final class DoctorCommand {
 		}
 
 		// -- 6. State file (read-only; never created) -----------------
-		if ($this->state->exists()) {
-			try {
-				$this->state->read();
-				$checks[] = ['name' => 'state_file', 'status' => 'ok', 'detail' => 'Readable, format_version supported: ' . $this->state->path()];
-			} catch (InstallerException $e) {
-				$checks[]    = ['name' => 'state_file', 'status' => 'fail', 'detail' => $e->getMessage()];
-				$failCodes[] = 5;
+		try {
+			$state = $this->state->read();
+			if ($state !== null) {
+				$recordedEnvironment = Environment::from($state['environment']);
+				$checks[] = ['name' => 'state_file', 'status' => 'ok', 'detail' => 'Readable v2 state with environment ' . $recordedEnvironment->value . ': ' . $this->state->path()];
+			} else {
+				$checks[] = ['name' => 'state_file', 'status' => 'ok', 'detail' => 'No state file yet: ' . $this->state->path()];
 			}
+		} catch (InstallerException $e) {
+			$checks[] = ['name' => 'state_file', 'status' => 'fail', 'detail' => $e->getMessage()];
+			$failCodes[] = ExitCode::UNSAFE_STATE->value;
+		}
+
+		$environment = $explicitEnvironment ?? $recordedEnvironment;
+		if ($environment instanceof Environment) {
+			$checks[] = ['name' => 'environment', 'status' => 'ok', 'detail' => $environment->value . ($explicitEnvironment !== null ? ' (explicit)' : ' (recorded)')];
+		} elseif ($this->locator->hasEnvironmentAwareEntries($manifests)) {
+			$checks[] = ['name' => 'environment', 'status' => 'fail', 'detail' => 'Environment-aware manifests require --environment=<dev|stage|prod> or a recorded v2 state environment.'];
+			$failCodes[] = ExitCode::GENERAL_ERROR->value;
 		} else {
-			$checks[] = ['name' => 'state_file', 'status' => 'ok', 'detail' => 'No state file yet (created on first install): ' . $this->state->path()];
+			$checks[] = ['name' => 'environment', 'status' => 'ok', 'detail' => 'No environment-aware manifest requires a selection.'];
+		}
+
+		// -- 8. Composer executable -----------------------------------
+		if ($this->composer->isAvailable()) {
+			$checks[] = ['name' => 'composer_binary', 'status' => 'ok', 'detail' => 'Composer is available for environment materialization.'];
+		} else {
+			$checks[] = ['name' => 'composer_binary', 'status' => 'fail', 'detail' => 'Composer is not available; install/environment materialization cannot run.'];
+			$failCodes[] = ExitCode::GENERAL_ERROR->value;
 		}
 
 		$exit = $this->exitCode($failCodes);
@@ -172,15 +209,18 @@ final class DoctorCommand {
 	 * @return array{0:string,1:string,2:int}  [status, detail, exitCodeContribution]
 	 */
 	private function checkWriteAccess(): array {
-		$targets = [
-			$this->appRoot,
-			$this->safeResolve('var/state/citomni'),
-			$this->safeResolve('var/backups/citomni-installer'),
-		];
-
 		$bad = [];
+		$targets = [$this->appRoot];
+		foreach (['var/state/citomni', 'var/backups/citomni-installer'] as $relative) {
+			try {
+				$targets[] = $this->pathGuard->resolveTarget($relative);
+			} catch (InstallerException $e) {
+				$bad[] = $e->getMessage();
+			}
+		}
 		foreach ($targets as $abs) {
-			if ($abs === null) {
+			if (\file_exists($abs) && !\is_dir($abs)) {
+				$bad[] = 'Not a directory: ' . $abs;
 				continue;
 			}
 			$dir = $this->nearestExistingDir($abs);
@@ -188,19 +228,11 @@ final class DoctorCommand {
 				$bad[] = $abs;
 			}
 		}
-
 		return $bad === []
 			? ['ok', 'App-root and var/ tree are writable.', ExitCode::OK->value]
-			: ['fail', 'Not writable: ' . \implode(', ', $bad), ExitCode::IO_ERROR->value];
+			: ['fail', 'Unsafe or not writable: ' . \implode(', ', $bad), ExitCode::IO_ERROR->value];
 	}
 
-	private function safeResolve(string $relative): ?string {
-		try {
-			return $this->pathGuard->resolveTarget($relative);
-		} catch (InstallerException) {
-			return null;
-		}
-	}
 
 	private function nearestExistingDir(string $abs): ?string {
 		$dir = $abs;

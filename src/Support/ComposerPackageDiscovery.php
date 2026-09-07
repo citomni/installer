@@ -29,9 +29,8 @@ use CitOmni\Installer\Exception\InstallerException;
  *
  * Discovery:
  * - Package set, install paths, versions and `extra` come from vendor/composer/installed.json.
- *   Composer\InstalledVersions is consulted only to refine a package's install path / version
- *   when it already knows that package; it does not expose `extra` and is a process-global that
- *   cannot describe an arbitrary vendor tree, so installed.json remains authoritative.
+ *   Process-global Composer\InstalledVersions metadata is not consulted: It may describe
+ *   a different application from the explicitly selected vendor tree.
  * - Composer 2 wraps entries in {"packages": [...]}; Composer 1 used a top-level list. Both are
  *   handled.
  *
@@ -109,7 +108,7 @@ final class ComposerPackageDiscovery {
 			}
 
 			$out[$name] = [
-				'version' => $this->resolveVersion($name, $entry),
+				'version' => $this->resolveVersion($entry),
 				'root'    => $root,
 				'extra'   => (isset($entry['extra']) && \is_array($entry['extra'])) ? $entry['extra'] : [],
 			];
@@ -124,27 +123,13 @@ final class ComposerPackageDiscovery {
 	// ----------------------------------------------------------------
 
 	/**
-	 * Resolve a package's absolute install path (InstalledVersions preferred, then installed.json).
+	 * Resolve a package's absolute install path (from this vendor tree's installed.json).
 	 *
 	 * @param  string              $name
 	 * @param  array<string,mixed> $entry  installed.json entry for the package.
 	 * @return string|null  Absolute, existing package root; null if it cannot be resolved.
 	 */
 	private function resolveRoot(string $name, array $entry): ?string {
-		if (
-			\class_exists(\Composer\InstalledVersions::class)
-			&& \method_exists(\Composer\InstalledVersions::class, 'getInstallPath')
-			&& \Composer\InstalledVersions::isInstalled($name)
-		) {
-			$path = \Composer\InstalledVersions::getInstallPath($name);
-			if (\is_string($path)) {
-				$real = \realpath($path);
-				if ($real !== false) {
-					return $real;
-				}
-			}
-		}
-
 		$installPath = $entry['install-path'] ?? null;
 		if (\is_string($installPath) && $installPath !== '') {
 			$base = $this->isAbsolutePath($installPath)
@@ -152,9 +137,7 @@ final class ComposerPackageDiscovery {
 				: $this->vendorDir . '/composer/' . $installPath;
 
 			$real = \realpath($base);
-			if ($real !== false) {
-				return $real;
-			}
+			return $real !== false && \is_dir($real) ? $real : null;
 		}
 
 		$real = \realpath($this->vendorDir . '/' . $name);
@@ -164,23 +147,12 @@ final class ComposerPackageDiscovery {
 
 
 	/**
-	 * Resolve a package's pretty version (InstalledVersions preferred, then installed.json).
+	 * Resolve a package's pretty version (from this vendor tree's installed.json).
 	 *
-	 * @param  string              $name
 	 * @param  array<string,mixed> $entry
 	 * @return string
 	 */
-	private function resolveVersion(string $name, array $entry): string {
-		if (
-			\class_exists(\Composer\InstalledVersions::class)
-			&& \Composer\InstalledVersions::isInstalled($name)
-		) {
-			$version = \Composer\InstalledVersions::getPrettyVersion($name);
-			if (\is_string($version)) {
-				return $version;
-			}
-		}
-
+	private function resolveVersion(array $entry): string {
 		$version = $entry['version'] ?? null;
 
 		return \is_string($version) ? $version : 'unknown';

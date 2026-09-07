@@ -16,22 +16,26 @@ declare(strict_types=1);
 namespace CitOmni\Installer\Cli;
 
 use CitOmni\Installer\Cli\Command\DoctorCommand;
+use CitOmni\Installer\Cli\Command\EnvironmentCommand;
 use CitOmni\Installer\Cli\Command\StatusCommand;
 use CitOmni\Installer\Cli\Command\InstallCommand;
 use CitOmni\Installer\Cli\Command\RepairCommand;
 use CitOmni\Installer\Cli\Command\SyncCommand;
 use CitOmni\Installer\Enum\ExitCode;
 use CitOmni\Installer\Operation\ApplyScaffoldPlan;
+use CitOmni\Installer\Operation\ApplyEnvironmentMaterialization;
 use CitOmni\Installer\Operation\BuildScaffoldPlan;
 use CitOmni\Installer\State\ScaffoldState;
 use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\ScaffoldManifestLocator;
 use CitOmni\Installer\Support\ScaffoldRenderer;
+use CitOmni\Installer\Support\ComposerRunner;
+use CitOmni\Installer\Support\InstallerLock;
 use CitOmni\Installer\Exception\InstallerException;
 
 /**
- * Minimal dispatcher for the installer commands (doctor, status, install, repair, sync).
+ * Minimal dispatcher for the installer commands (doctor, status, install, environment, repair, sync).
  *
  * Responsibilities:
  * - Route argv to a command, or print usage/help.
@@ -50,7 +54,7 @@ use CitOmni\Installer\Exception\InstallerException;
 final class InstallerCli {
 
 	/** Commands handled by this layer. */
-	private const COMMANDS = ['doctor', 'status', 'install', 'repair', 'sync'];
+	private const COMMANDS = ['doctor', 'status', 'install', 'environment', 'repair', 'sync'];
 
 	public function __construct(private readonly string $appRoot) {}
 
@@ -111,25 +115,40 @@ final class InstallerCli {
 		try {
 			switch ($name) {
 				case 'doctor':
-					return (new DoctorCommand($appRoot, $pathGuard, $locator, $state, $resolver))->run($cmdArgs);
+					$composer = new ComposerRunner($appRoot);
+					return (new DoctorCommand($appRoot, $pathGuard, $locator, $state, $resolver, $composer))->run($cmdArgs);
+
 				case 'status':
 					$builder = new BuildScaffoldPlan($pathGuard, new ScaffoldRenderer(), $state);
-					return (new StatusCommand($locator, $builder, $resolver))->run($cmdArgs);
+					return (new StatusCommand($appRoot, $locator, $builder, $resolver, $state))->run($cmdArgs);
+
 				case 'install':
+				case 'environment':
 				case 'repair':
 				case 'sync':
-					// Write commands share one renderer between the plan builder and the
-					// applier. The applier is the ONLY collaborator allowed to touch disk.
+					$lock = new InstallerLock($pathGuard);
 					$renderer = new ScaffoldRenderer();
-					$builder  = new BuildScaffoldPlan($pathGuard, $renderer, $state);
-					$applier  = new ApplyScaffoldPlan($pathGuard, $renderer, $state);
-					$command  = match ($name) {
-						'install' => new InstallCommand($locator, $builder, $applier, $resolver),
-						'repair'  => new RepairCommand($locator, $builder, $applier, $resolver),
-						default   => new SyncCommand($locator, $builder, $applier, $resolver),
+					$builder = new BuildScaffoldPlan($pathGuard, $renderer, $state);
+					$applier = new ApplyScaffoldPlan($pathGuard, $renderer, $state);
+
+					if ($name === 'install' || $name === 'environment') {
+						$materializer = new ApplyEnvironmentMaterialization(
+							$applier,
+							new ComposerRunner($appRoot),
+							$state
+						);
+					}
+
+					$command = match ($name) {
+						'install' => new InstallCommand($locator, $builder, $applier, $resolver, $state, $lock, $materializer),
+						'environment' => new EnvironmentCommand($locator, $builder, $applier, $resolver, $state, $lock, $materializer),
+						'repair' => new RepairCommand($locator, $builder, $applier, $resolver, $state, $lock),
+						default => new SyncCommand($locator, $builder, $applier, $resolver, $state, $lock),
 					};
+
 					return $command->run($cmdArgs);
 			}
+
 		} catch (\Throwable $e) {
 			// Boundary catch: known domain errors are handled inside the commands
 			// and mapped to specific exit codes; anything else surfaces as a
@@ -156,16 +175,17 @@ final class InstallerCli {
 	 *
 	 * Recognised: --package=<vendor/name>, --format=text|json,
 	 * --placeholder=KEY=VALUE (repeatable), --force, --force=yes,
-	 * --dry-run, --help/-h.
-	 * Positional arguments are rejected here (only sync accepts one).
+	 * --environment=<dev|stage|prod>, --dry-run, --help/-h.
+	 * Positional arguments are rejected here; commands with positionals extract them first.
 	 *
 	 * @param  array<int,string>  $args  Arguments after the command name.
-	 * @return array{ok:true,options:array{package:?string,format:string,placeholders:array<string,string>,force:bool,force_confirmed:bool,dry_run:bool,help:bool}}|array{ok:false,error:string}
+	 * @return array{ok:true,options:array{package:?string,environment:?string,format:string,placeholders:array<string,string>,force:bool,force_confirmed:bool,dry_run:bool,help:bool}}|array{ok:false,error:string}
 	 */
 	public static function parseCommonOptions(array $args): array {
 
 		$options = [
 			'package'         => null,
+			'environment'     => null,
 			'format'          => 'text',
 			'placeholders'    => [],
 			'force'           => false,
@@ -198,6 +218,15 @@ final class InstallerCli {
 
 			if ($arg === '--dry-run') {
 				$options['dry_run'] = true;
+				continue;
+			}
+
+			if (\str_starts_with($arg, '--environment=')) {
+				$value = \substr($arg, 14);
+				if ($value === '') {
+					return self::usageError('--environment requires a value.');
+				}
+				$options['environment'] = $value;
 				continue;
 			}
 
@@ -273,12 +302,14 @@ Usage:
 Commands:
   doctor    Validate environment, manifests, installer config and write access.
   status    Report scaffold state per package.
-  install   Create missing scaffold files and record their baseline.
+  install   Perform initial materialization for an explicit environment.
+  environment  Switch environment-aware files and Composer posture.
   repair    Recreate missing files from recorded state.
   sync      Sync package-owned scaffold to the current baseline.
 
 Global options:
-  --package=<vendor/name>   Limit to a single package.
+  --package=<vendor/name>   Limit supported commands to a single package.
+  --environment=<env>       Select dev|stage|prod where supported.
   --format=text|json        Output format (default: text).
   --placeholder=KEY=VALUE   Provide a placeholder value (repeatable; overrides config).
   --force                   Force overwrite, but ask before writing.
@@ -297,7 +328,7 @@ TXT;
 citomni-installer doctor — read-only environment validation
 
 Usage:
-  citomni-installer doctor [--package=<vendor/name>] [--format=text|json]
+  citomni-installer doctor [--package=<vendor/name>] [--environment=<dev|stage|prod>] [--format=text|json]
 
 Checks app-root, vendor/, Composer metadata, scaffold manifests, the installer
 config (config/citomni_installer.php) and write access. If a state file exists it
@@ -312,7 +343,7 @@ TXT,
 citomni-installer status — read-only scaffold status
 
 Usage:
-  citomni-installer status [--package=<vendor/name>] [--format=text|json]
+  citomni-installer status [--package=<vendor/name>] [--environment=<dev|stage|prod>] [--format=text|json]
                            [--placeholder=KEY=VALUE ...]
 
 Reports per file: missing, up_to_date, update_available (stub drift),
@@ -332,18 +363,39 @@ TXT,
 citomni-installer install — first materialization for a package
 
 Usage:
-  citomni-installer install [--package=<vendor/name>] [--format=text|json]
+  citomni-installer install --environment=<dev|stage|prod> [--package=<vendor/name>] [--format=text|json]
                             [--placeholder=KEY=VALUE ...] [--force|--force=yes] [--dry-run]
 
-Creates missing managed and create-only files from the current stubs and records
-their baseline (stub + rendered checksums, policy, placeholder snapshot) in the
-state file. Existing files are NOT overwritten unless --force is given. Forced 
-overwrites are backed up first. Plain --force asks before writing; --force=yes 
-confirms without prompting. Use --dry-run to preview.
+Performs initial scaffold materialization for the selected environment, applies
+CitOmni's Composer classmap-authoritative posture, dumps autoload with --no-scripts,
+and commits v2 installer state only after all materialization succeeds. Existing
+environment-aware files must already match the requested environment; use the
+environment command to switch them. --force applies only to ordinary scaffold
+conflicts and never acts as an environment switch. Initial materialization requires
+all packages; --package is available only after an environment is recorded.
+Use --dry-run to preview.
 
 Exit codes:
   0  applied / nothing to do   4  conflicts (existing files in the way)
   6  IO/permission error       1  error                  2  invalid usage
+
+TXT,
+			'environment' => <<<TXT
+citomni-installer environment — switch the materialized application environment
+
+Usage:
+  citomni-installer environment <dev|stage|prod> [--format=text|json]
+                                [--placeholder=KEY=VALUE ...] [--dry-run]
+
+Switches only environment-aware scaffold targets. Desired environment bytes are
+authoritative: differing existing files are backed up and atomically replaced.
+Environment-agnostic scaffold is untouched. Composer classmap-authoritative is
+then set for the target environment and dump-autoload --no-scripts is run before
+one final state commit. --force and --package are intentionally unsupported.
+
+Exit codes:
+  0  applied / nothing to do   1  error                  2  invalid usage
+  5  unsafe state              6  IO/permission error
 
 TXT,
 			'repair' => <<<TXT

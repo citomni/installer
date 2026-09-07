@@ -2,6 +2,8 @@
 
 Official scaffold lifecycle tool for CitOmni applications.
 
+Environment materialization uses explicit `dev`, `stage`, or `prod` selection and strict state format 2. See [environment materialization](docs/environment-materialization.md) for recovery, locking, Composer requirements, and regression tests.
+
 `citomni/installer` is the package-owned scaffold materializer for the CitOmni ecosystem. It discovers scaffold manifests from installed Composer packages, renders package-owned scaffold files, writes the few files that must physically exist in the application layer, and tracks their state so future repairs and scaffold updates can be handled safely.
 
 The package is deliberately narrow. It is not a framework runtime, not a web updater, not a Composer replacement, not a historical restore tool, and not a merge engine with a heroic cape and a questionable threat model.
@@ -57,13 +59,14 @@ No smoke, no mirrors, and preferably no wizard hat in production.
 - Placeholder rendering using deterministic placeholder sources.
 - Registration of rendered files in app-local installer state.
 - Conservative handling of existing unknown files.
-- Targeted package filtering through `--package=vendor/package`.
+- Targeted package filtering through `--package=vendor/package` after the initial application-wide materialization.
 
 ### Scaffold lifecycle commands
 
 - `doctor` for read-only environment validation.
 - `status` for read-only scaffold status.
-- `install` for first-time package scaffold materialization.
+- `install --environment=<dev|stage|prod>` for initial scaffold and Composer materialization.
+- `environment <dev|stage|prod>` for authoritative switching of environment-aware targets.
 - `repair` for recreating missing scaffold files from recorded state using the currently installed package stub and the recorded placeholder snapshot.
 - `sync` for controlled updates of managed scaffold files.
 
@@ -110,7 +113,7 @@ It does **not** own:
 - The contents of CLI scaffold stubs.
 - Application business code.
 - Application root-level files after `composer create-project`.
-- `composer.json` or `composer.lock` mutation.
+- General `composer.json` editing or `composer.lock` mutation. Environment materialization sets only `config.classmap-authoritative` through Composer and regenerates autoload files.
 - Composer dependency resolution.
 - Composer `require` or `update` execution.
 - GitHub repository creation.
@@ -258,20 +261,22 @@ No CitOmni provider registration is required for MVP usage. The installer is a C
 
 ```bash
 composer require citomni/http
-vendor/bin/citomni-installer install --package=citomni/http
+vendor/bin/citomni-installer install --environment=dev
 ```
 
-If the installed scaffold uses placeholders such as `{{ CITOMNI_ENVIRONMENT }}`, provide them either through `config/citomni_installer.php` or through repeated `--placeholder=KEY=VALUE` options before running `install`.
+Environment-aware manifests select their source through `--environment`; the environment is not a placeholder override. Supply other required tokens through `config/citomni_installer.php` or repeated `--placeholder=KEY=VALUE` options.
+
+After the initial application-wide install, package filtering is allowed with the recorded environment:
 
 ```bash
-vendor/bin/citomni-installer install --package=citomni/http --placeholder=CITOMNI_ENVIRONMENT=dev
+vendor/bin/citomni-installer install --environment=dev --package=citomni/http
 ```
 
 ### Add CLI support
 
 ```bash
 composer require citomni/cli
-vendor/bin/citomni-installer install --package=citomni/cli
+vendor/bin/citomni-installer install --environment=dev
 ```
 
 ### Check scaffold status
@@ -310,7 +315,7 @@ Example:
 {
 	"scripts": {
 		"citomni:status": "vendor/bin/citomni-installer status",
-		"citomni:install": "vendor/bin/citomni-installer install",
+		"citomni:install": "vendor/bin/citomni-installer install --environment=dev",
 		"citomni:sync": "vendor/bin/citomni-installer sync",
 		"citomni:repair": "vendor/bin/citomni-installer repair",
 		"citomni:doctor": "vendor/bin/citomni-installer doctor"
@@ -369,27 +374,27 @@ vendor/bin/citomni-installer status --format=json
 
 ### `install`
 
-Materializes scaffold for a newly installed package or runtime mode.
+Materializes scaffold for an explicitly selected environment. The first install must omit `--package`; later installs may filter packages while using the recorded environment. Use `environment <env>` to switch environments, including when `--force` is supplied.
 
 Default behavior:
 
 - Creates missing files.
 - Does not overwrite existing files.
-- Registers created files in installer state.
+- Registers created files and adopts existing exact rendered matches in installer state.
 - Stores checksum and placeholder metadata where relevant.
 - Fails clearly on conflicts.
 
-Example:
+Initial materialization:
 
 ```bash
-vendor/bin/citomni-installer install --package=citomni/http
+vendor/bin/citomni-installer install --environment=dev
 ```
 
 Forced replacement:
 
 ```bash
-vendor/bin/citomni-installer install --package=citomni/http --force
-vendor/bin/citomni-installer install --package=citomni/http --force=yes
+vendor/bin/citomni-installer install --environment=dev --package=citomni/http --force
+vendor/bin/citomni-installer install --environment=dev --package=citomni/http --force=yes
 ```
 
 `--force` allows existing scaffold targets to be overwritten, but asks for interactive confirmation before writing. `--force=yes` confirms the overwrite without prompting and is intended for scripts or explicitly confirmed manual runs. Forced replacements create backups before writing.
@@ -652,7 +657,7 @@ Future versions may add Composer metadata, existing CitOmni config, or explicit 
 Example:
 
 ```bash
-vendor/bin/citomni-installer install --package=citomni/http --placeholder=APP_NAMESPACE=App
+vendor/bin/citomni-installer install --environment=dev --package=citomni/http --placeholder=APP_NAMESPACE=App
 ```
 
 `APP_NAMESPACE` should be explicit when Composer autoload configuration is ambiguous.
@@ -662,6 +667,8 @@ vendor/bin/citomni-installer install --package=citomni/http --placeholder=APP_NA
 ## State and checksums
 
 Installer state is stored in the application, not in the installer package, runtime package, or `/vendor/`.
+
+Only state format 2 is accepted; there is no state format 1 migration or fallback. State records the application environment in addition to package/file metadata.
 
 The state path is fixed:
 
@@ -698,19 +705,19 @@ Package semver is useful metadata, but it must not drive sync decisions alone. A
 
 ## Write safety model
 
-Default behavior is conservative.
+The table below covers ordinary scaffold lifecycle commands. `environment <env>` authoritatively replaces differing environment-aware targets with backups, and does not touch source-only entries.
 
 | Situation | Default behavior |
 |---|---|
 | Target is missing | Create file |
-| Managed target exists but has no state | `install` reports a conflict; `sync` adopts an exact current rendered match, otherwise writes `.new` unless forced |
+| Managed target exists but has no state | `install` and `sync` adopt an exact current rendered match; otherwise `install` conflicts and `sync` writes `.new` unless forced |
 | Managed target matches previous `rendered_checksum` | Leave unchanged if it also matches the current render; otherwise update to the current render |
 | Target is locally modified | Do not overwrite |
 | Target is `create-only` and exists | Do not touch unless explicitly forced |
 | Target is outside app root | Fail |
 | Source is missing in package | Fail |
 | Manifest is invalid | Fail |
-| State is unknown or unsafe | Fail without writing |
+| State is unknown or unsafe | Fail without materializing scaffold or committing state; a real write command may leave its administrative lock file |
 
 Plain `--force` asks for confirmation before destructive writes. `--force=yes` confirms the same destructive write without prompting. Both modes create backups before replacing existing files.
 
@@ -719,10 +726,12 @@ When forced replacement overwrites a file, the installer must create a backup fi
 Forced-overwrite backups are stored under:
 
 ```text
-var/backups/citomni-installer/<utc-timestamp>/path/to/file
+var/backups/citomni-installer/<utc-microseconds>-<random-suffix>/path/to/file
 ```
 
-Scaffold files, `.new` files, backups, and state are written through temporary files and renamed into place.
+Scaffold files, `.new` files, backups, and state are written through temporary files and renamed into place. Existing Unix rwx permission bits are preserved.
+
+Real write commands share the persistent advisory lock `var/state/citomni/installer.lock`. Dry runs create no lock or scaffold files. Planned target bytes are checked again during apply. Read `backup_dir` from the command JSON result instead of guessing the newest backup by directory modification time.
 
 ---
 
@@ -789,8 +798,7 @@ A typical project-tooling flow may look like this:
 Create application workspace
 	composer create-project citomni/app-skeleton <path>
 	composer require citomni/http and/or citomni/cli
-	vendor/bin/citomni-installer install --package=citomni/http
-	vendor/bin/citomni-installer install --package=citomni/cli
+	vendor/bin/citomni-installer install --environment=dev
 	Create project repository
 	Push initial commit
 	Register the application in external tooling

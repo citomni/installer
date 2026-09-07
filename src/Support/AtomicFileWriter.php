@@ -16,6 +16,7 @@ declare(strict_types=1);
 namespace CitOmni\Installer\Support;
 
 use CitOmni\Installer\Exception\InstallerException;
+use CitOmni\Installer\Exception\FilesystemException;
 
 /**
  * Low-level atomic file writer shared by the installer's write sites.
@@ -34,6 +35,7 @@ use CitOmni\Installer\Exception\InstallerException;
  *   so callers keep a single exception currency.
  * - A short write, an open failure, or a failed rename all throw InstallerException. On any
  *   failure the temp file is removed on a best-effort basis.
+ * - Existing Unix rwx permission bits are preserved; ownership and ACLs are not copied.
  * - After a successful rename, opcache_invalidate() is called (best effort) so a subsequent
  *   include of the same path does not serve stale opcodes.
  *
@@ -67,6 +69,15 @@ final class AtomicFileWriter {
 	public static function write(string $absPath, string $bytes): void {
 		$dir = \dirname($absPath);
 		self::ensureDir($dir);
+		\clearstatcache(true, $absPath);
+		$mode = null;
+		if (\PHP_OS_FAMILY !== 'Windows' && \is_file($absPath)) {
+			$permissions = \fileperms($absPath);
+			if ($permissions === false) {
+				throw new FilesystemException('Unable to read destination permissions: ' . $absPath);
+			}
+			$mode = $permissions & 0777;
+		}
 
 		// random_bytes() throws \Random\RandomException if the CSPRNG is unavailable. Keep the
 		// failure inside the installer's exception currency: InstallerException is what the
@@ -78,16 +89,22 @@ final class AtomicFileWriter {
 		}
 
 		$tmp    = $dir . '/' . self::TMP_PREFIX . $rand . '.tmp';
-		$handle = \fopen($tmp, 'wb');
+		$handle = @\fopen($tmp, 'xb');
 		if ($handle === false) {
-			throw new InstallerException(\sprintf('Unable to open temp file for writing: %s', $tmp));
+			throw new FilesystemException(\sprintf('Unable to open temp file for writing: %s', $tmp));
 		}
 		try {
+			// Apply restrictive permissions before placing any bytes in the temp file.
+			if ($mode !== null && !@\chmod($tmp, $mode)) {
+				throw new FilesystemException('Unable to preserve destination permissions: ' . $absPath);
+			}
 			$written = \fwrite($handle, $bytes);
 			if ($written === false || $written !== \strlen($bytes)) {
-				throw new InstallerException(\sprintf('Failed to write complete temp file: %s', $tmp));
+				throw new FilesystemException(\sprintf('Failed to write complete temp file: %s', $tmp));
 			}
-			\fflush($handle);
+			if (!\fflush($handle)) {
+				throw new FilesystemException('Unable to flush temp file: ' . $tmp);
+			}
 			// Best-effort durability; not every filesystem supports fsync.
 			if (\function_exists('fsync')) {
 				@\fsync($handle);
@@ -95,13 +112,13 @@ final class AtomicFileWriter {
 		} catch (\Throwable $e) {
 			\fclose($handle);
 			@\unlink($tmp);
-			throw $e instanceof InstallerException ? $e : new InstallerException(\sprintf('Failed writing temp file: %s', $tmp), 0, $e);
+			throw $e instanceof InstallerException ? $e : new FilesystemException(\sprintf('Failed writing temp file: %s', $tmp), 0, $e);
 		}
 		\fclose($handle);
 
 		if (!@\rename($tmp, $absPath)) {
 			@\unlink($tmp);
-			throw new InstallerException(\sprintf('Failed to move file into place atomically: %s', $absPath));
+			throw new FilesystemException(\sprintf('Failed to move file into place atomically: %s', $absPath));
 		}
 
 		// Avoid a stale opcode cache serving a previous version of this path.
@@ -122,8 +139,8 @@ final class AtomicFileWriter {
 		if (\is_dir($dir)) {
 			return;
 		}
-		if (!\mkdir($dir, 0775, true) && !\is_dir($dir)) {
-			throw new InstallerException(\sprintf('Unable to create directory: %s', $dir));
+		if (!@\mkdir($dir, 0775, true) && !\is_dir($dir)) {
+			throw new FilesystemException(\sprintf('Unable to create directory: %s', $dir));
 		}
 	}
 }

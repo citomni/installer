@@ -90,7 +90,14 @@ final class PathGuard {
 	 * @throws InstallerException      When the path is unsafe or escapes app-root.
 	 */
 	public function resolveTarget(string $relativeTarget): string {
-		return $this->resolveWithinBase($this->appRoot, $relativeTarget, 'target');
+		$resolved = $this->resolveWithinBase($this->appRoot, $relativeTarget, 'target');
+		$vendor = $this->appRoot . '/vendor';
+		$caseInsensitive = \PHP_OS_FAMILY === 'Windows';
+		if (Path::isInside($vendor, $resolved, $caseInsensitive)
+			|| Path::isInside(\realpath($vendor) ?: $vendor, $resolved, $caseInsensitive)) {
+			throw new InstallerException('Scaffold targets must not write into vendor: ' . $relativeTarget);
+		}
+		return $resolved;
 	}
 
 
@@ -138,6 +145,7 @@ final class PathGuard {
 	 */
 	private function resolveWithinBase(string $baseReal, string $relative, string $kind): string {
 		$this->assertSafeRelative($kind, $relative);
+		\clearstatcache(true);
 
 		$rel   = Path::normalizeRelative($relative);
 		$parts = \explode('/', $rel);
@@ -148,6 +156,9 @@ final class PathGuard {
 		foreach ($parts as $part) {
 			$candidate = $existing . '/' . $part;
 			if (!\file_exists($candidate)) {
+				if (\is_link($candidate)) {
+					throw new InstallerException('Dangling symlink in ' . $kind . ' path: ' . $candidate);
+				}
 				break;
 			}
 			$existing = $candidate;
@@ -163,7 +174,7 @@ final class PathGuard {
 			));
 		}
 
-		if (!Path::isInside($baseReal, $ancestor)) {
+		if (!Path::isInside($baseReal, $ancestor, \PHP_OS_FAMILY === 'Windows')) {
 			throw new InstallerException(\sprintf(
 				'Resolved %s escapes its base via symlink: %s is not inside %s',
 				$kind,
@@ -176,7 +187,7 @@ final class PathGuard {
 		$resolved = $tail === [] ? $ancestor : $ancestor . '/' . \implode('/', $tail);
 
 		// Defense in depth: the validated tail carries no "..", so this must already hold.
-		if (!Path::isInside($baseReal, $resolved)) {
+		if (!Path::isInside($baseReal, $resolved, \PHP_OS_FAMILY === 'Windows')) {
 			throw new InstallerException(\sprintf(
 				'Resolved %s escapes its base: %s is not inside %s',
 				$kind,

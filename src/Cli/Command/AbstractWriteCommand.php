@@ -17,47 +17,43 @@ namespace CitOmni\Installer\Cli\Command;
 
 use CitOmni\Installer\Cli\InstallerCli;
 use CitOmni\Installer\Enum\ExitCode;
+use CitOmni\Installer\Enum\Environment;
+use CitOmni\Installer\State\ScaffoldState;
 use CitOmni\Installer\Operation\ApplyScaffoldPlan;
 use CitOmni\Installer\Operation\BuildScaffoldPlan;
 use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\ScaffoldManifestLocator;
 use CitOmni\Installer\Exception\InstallerException;
+use CitOmni\Installer\Exception\FilesystemException;
+use CitOmni\Installer\Exception\ConflictException;
+use CitOmni\Installer\Support\InstallerLock;
 
 /**
- * Shared transport layer for the write commands (install, repair, sync).
+ * Shared transport, locking, reporting, and lifecycle flow for write commands.
  *
- * The three write commands are identical at the CLI boundary: parse the common
- * option grammar, resolve manifests + placeholders, ask BuildScaffoldPlan for a
- * plan, hand that plan to ApplyScaffoldPlan, then map the apply result to an exit
- * code and render it. The only per-command differences live in the engine
- * (the command verb passed to BuildScaffoldPlan) and in whether a positional
- * [target] is accepted (sync only). Those two seams are the abstract/overridable
- * hooks below; everything else is inherited so the verbs cannot drift apart.
+ * Repair and sync use the inherited scaffold flow. Install and environment use
+ * ApplyEnvironmentMaterialization and share the lock and output helpers here.
+ * Every real write command holds the application lock from before discovery/state
+ * reads through scaffold writes, Composer when applicable, and state persistence.
+ * Dry runs do not acquire the lock or write any application files.
  *
- * Boundaries:
- * - This class never writes app files or state. ApplyScaffoldPlan is the only
- *   collaborator that may mutate disk; this class only shapes input and output.
- * - --dry-run is forwarded to the applier (which still computes the same plan and
- *   therefore the same exit code, just without touching disk).
- * - --force is forwarded to the plan builder. install honours it (forced
- *   overwrite + backup); sync honours it; repair's decision graph ignores it.
- *
- * Exit codes (per the installer contract, derived from the apply result):
- * - 0  every actionable file was created/updated/registered, or nothing to do.
- * - 4  at least one file requires manual action: install refused an existing file
- *      (conflict), or sync wrote a sibling <target>.new instead of overwriting.
- * - 1  at least one file failed to apply (stale plan, internal plan error, or a
- *      per-file IO failure). Per-file error detail is in the rendered output.
- * - 6  the apply step itself raised (e.g. the state file could not be written).
- * - 2  invalid usage / arguments (from the shared option parser).
+ * Exit codes:
+ * - 0: Every actionable file succeeded, or nothing needs changing.
+ * - 1: General validation, planning, Composer, or internal apply failure.
+ * - 2: Invalid usage or arguments.
+ * - 4: A conflict, stale plan, competing writer, or generated .new needs attention.
+ * - 5: The command cannot safely read recorded scaffold state.
+ * - 6: A filesystem operation failed, including a per-file apply failure.
  */
 abstract class AbstractWriteCommand {
 
 	public function __construct(
-		private readonly ScaffoldManifestLocator $locator,
-		private readonly BuildScaffoldPlan $builder,
-		private readonly ApplyScaffoldPlan $applier,
-		private readonly PlaceholderResolver $placeholders
+		protected readonly ScaffoldManifestLocator $locator,
+		protected readonly BuildScaffoldPlan $builder,
+		protected readonly ApplyScaffoldPlan $applier,
+		protected readonly PlaceholderResolver $placeholders,
+		protected readonly ScaffoldState $state,
+		protected readonly InstallerLock $lock
 	) {}
 
 
@@ -97,28 +93,48 @@ abstract class AbstractWriteCommand {
 			\fwrite(\STDERR, $parsed['error'] . "\n");
 			return ExitCode::USAGE_ERROR->value;
 		}
-		$opt    = $parsed['options'];
+		$opt = $parsed['options'];
+		if ($opt['environment'] !== null) {
+			return $this->fail($opt['format'], '--environment is not accepted by ' . $this->commandName() . '.', ExitCode::USAGE_ERROR->value);
+		}
+		return $this->withWriteLock($opt, fn(): int => $this->runScaffold($opt, $target));
+	}
+
+	/** Run the parsed lifecycle command while the caller holds the write lock. */
+	private function runScaffold(array $opt, ?string $target): int {
 		$format = $opt['format'];
 
 		// -- 3. Manifests ---------------------------------------------
 		try {
 			$manifests = $this->resolveManifests($opt['package']);
 		} catch (InstallerException $e) {
-			return $this->fail($format, $e->getMessage(), ExitCode::GENERAL_ERROR->value);
+			return $this->fail($format, $e->getMessage(), $this->exceptionExitCode($e));
 		}
 		if ($manifests === []) {
 			return $this->emptyResult($format, $opt['package']);
 		}
 
+		try {
+			$environment = $this->state->environment();
+		} catch (InstallerException $e) {
+			return $this->fail($format, $e->getMessage(), ExitCode::UNSAFE_STATE->value);
+		}
+
+		if (!$environment instanceof Environment) {
+			return $this->fail(
+				$format,
+				'No materialized environment is recorded. Run install --environment=<dev|stage|prod> first.',
+				ExitCode::GENERAL_ERROR->value
+			);
+		}
+
+		$manifests = $this->locator->selectEnvironment($manifests, $environment);
+
 		// -- 4. Placeholders (config + CLI overrides) -----------------
 		try {
-			$resolved = $this->placeholders->resolve($opt['placeholders']);
+			$placeholders = $this->resolvePlaceholders($manifests, $opt['placeholders']);
 		} catch (InstallerException $e) {
-			return $this->fail($format, $e->getMessage(), ExitCode::GENERAL_ERROR->value);
-		}
-		$placeholders = [];
-		foreach (\array_keys($manifests) as $pkgName) {
-			$placeholders[$pkgName] = $resolved;
+			return $this->fail($format, $e->getMessage(), $this->exceptionExitCode($e));
 		}
 
 		// -- 5. Build the plan ----------------------------------------
@@ -131,10 +147,8 @@ abstract class AbstractWriteCommand {
 		} catch (InstallerException $e) {
 			return $this->fail(
 				$format,
-				$e->getMessage()
-				. "\nHint: rendering managed stubs requires every token to resolve. Provide the "
-				. 'missing value(s) via config/citomni_installer.php or --placeholder=KEY=VALUE.',
-				1
+				$e->getMessage(),
+				$this->exceptionExitCode($e)
 			);
 		}
 
@@ -143,13 +157,13 @@ abstract class AbstractWriteCommand {
 			return $confirmExit;
 		}
 
-		// -- 6. Apply the plan (the only writer) ----------------------
+		// -- 6. Apply scaffold files and state ----------------------
 		try {
 			$result = $this->applier->apply($plan, ['dry_run' => $opt['dry_run']]);
 		} catch (InstallerException $e) {
 			// The applier swallows per-file failures; reaching here means the apply
 			// step itself failed (e.g. the state file could not be persisted).
-			return $this->fail($format, $e->getMessage(), ExitCode::IO_ERROR->value);
+			return $this->fail($format, $e->getMessage(), $this->exceptionExitCode($e));
 		}
 
 		// -- 7. Emit + exit -------------------------------------------
@@ -160,6 +174,39 @@ abstract class AbstractWriteCommand {
 			$this->emitText($result, $exit);
 		}
 		return $exit;
+	}
+
+
+	/**
+	 * Hold the shared application lock across all reads, writes, and finalization.
+	 *
+	 * @param array<string,mixed> $opt Parsed options.
+	 * @param callable():int $run Command body, after transport validation.
+	 * @return int Command result or a mapped lock error.
+	 */
+	protected function withWriteLock(array $opt, callable $run): int {
+		if ($opt['dry_run']) {
+			return $run();
+		}
+		try {
+			$this->lock->acquire();
+		} catch (InstallerException $e) {
+			return $this->fail($opt['format'], $e->getMessage(), $this->exceptionExitCode($e));
+		}
+		try {
+			return $run();
+		} finally {
+			$this->lock->release();
+		}
+	}
+
+	/** Map transport-independent failures to the documented CLI exit codes. */
+	protected function exceptionExitCode(InstallerException $e): int {
+		return match (true) {
+			$e instanceof FilesystemException => ExitCode::IO_ERROR->value,
+			$e instanceof ConflictException => ExitCode::CONFLICT->value,
+			default => ExitCode::GENERAL_ERROR->value,
+		};
 	}
 
 
@@ -176,7 +223,7 @@ abstract class AbstractWriteCommand {
 	 * @param  array<int,string>  $args
 	 * @return array{0:?string,1:array<int,string>}
 	 */
-	private function extractPositionalTarget(array $args): array {
+	protected function extractPositionalTarget(array $args): array {
 		$target = null;
 		$rest   = [];
 		foreach ($args as $arg) {
@@ -193,12 +240,32 @@ abstract class AbstractWriteCommand {
 	 * @return array<string,array<string,mixed>>
 	 * @throws InstallerException
 	 */
-	private function resolveManifests(?string $package): array {
+	protected function resolveManifests(?string $package): array {
 		if ($package === null) {
 			return $this->locator->discover();
 		}
 		$one = $this->locator->discoverPackage($package);
 		return $one === null ? [] : [$package => $one];
+	}
+
+
+	/**
+	 * Resolve one placeholder map and apply it to every selected package.
+	 *
+	 * @param array<string,array<string,mixed>> $manifests Planner-ready manifests.
+	 * @param array<string,string> $overrides CLI placeholder overrides.
+	 * @return array<string,array<string,string>> Placeholders keyed by package name.
+	 * @throws InstallerException When placeholder resolution fails.
+	 */
+	protected function resolvePlaceholders(array $manifests, array $overrides): array {
+		$resolved = $this->placeholders->resolve($overrides);
+		$out = [];
+
+		foreach (\array_keys($manifests) as $pkgName) {
+			$out[$pkgName] = $resolved;
+		}
+
+		return $out;
 	}
 
 
@@ -209,7 +276,7 @@ abstract class AbstractWriteCommand {
 	 * @param  array<string,mixed>  $opt
 	 * @return ?int  Null when execution may continue; otherwise an exit code.
 	 */
-	private function confirmForcedPlanIfNeeded(array $plan, string $format, array $opt): ?int {
+	protected function confirmForcedPlanIfNeeded(array $plan, string $format, array $opt): ?int {
 		if (empty($opt['force']) || !empty($opt['force_confirmed']) || !empty($opt['dry_run'])) {
 			return null;
 		}
@@ -257,7 +324,7 @@ abstract class AbstractWriteCommand {
 	 * @param  array<string,mixed>  $plan
 	 * @return int
 	 */
-	private function countForcedOverwrites(array $plan): int {
+	protected function countForcedOverwrites(array $plan): int {
 		$count = 0;
 
 		foreach ((array)($plan['packages'] ?? []) as $pkg) {
@@ -284,19 +351,19 @@ abstract class AbstractWriteCommand {
 	/**
 	 * Map the apply result to an exit code.
 	 *
-	 * Precedence: a hard failure (1) outranks a manual-action outcome (4), which
-	 * outranks success (0). 'failed' is intentionally mapped to the generic error
-	 * code rather than 6, because it conflates IO, stale-plan, and internal-plan
-	 * causes; an IO failure that is unambiguously IO (the apply throw) is mapped
-	 * to 6 in run().
+	 * Precedence: Filesystem failures (6), general failures (1), conflicts (4), success (0).
+	 * Per-file error_type preserves the filesystem/conflict distinction. State-read
+	 * validation is mapped separately by the caller to unsafe state (5).
 	 */
-	private function exitCodeFor(array $result): int {
+	protected function exitCodeFor(array $result): int {
+		$hasIoFailure = false;
 		$hasFailure  = false;
 		$hasConflict = false;
 		foreach ((array)($result['packages'] ?? []) as $pkg) {
 			foreach ((array)($pkg['files'] ?? []) as $file) {
 				switch ((string)($file['applied'] ?? '')) {
 					case 'failed':
+						$hasIoFailure = $hasIoFailure || ($file['error_type'] ?? null) === 'io';
 						$hasFailure = true;
 						break;
 					case 'conflict':
@@ -305,6 +372,9 @@ abstract class AbstractWriteCommand {
 						break;
 				}
 			}
+		}
+		if ($hasIoFailure) {
+			return ExitCode::IO_ERROR->value;
 		}
 		if ($hasFailure) {
 			return ExitCode::GENERAL_ERROR->value;
@@ -320,11 +390,14 @@ abstract class AbstractWriteCommand {
 	// Output
 	// ----------------------------------------------------------------
 
-	private function emitText(array $result, int $exit): void {
+	protected function emitText(array $result, int $exit): void {
 		$command = (string)($result['command'] ?? $this->commandName());
 		$dryRun  = (bool)($result['dry_run'] ?? false);
 
 		$out = 'citomni-installer ' . $command . ($dryRun ? ' (dry-run)' : '') . "\n";
+		if (isset($result['environment'])) {
+			$out .= 'Environment: ' . (string)$result['environment'] . "\n";
+		}
 		$any = false;
 		foreach ((array)($result['packages'] ?? []) as $pkg) {
 			$any  = true;
@@ -353,12 +426,20 @@ abstract class AbstractWriteCommand {
 		if (!empty($result['backup_dir'])) {
 			$out .= "\nBackups: " . (string)$result['backup_dir'] . "\n";
 		}
+		if (isset($result['composer'])) {
+			$composer = $result['composer'];
+			$out .= \sprintf(
+				"\nComposer: classmap-authoritative=%s; dump-autoload --no-scripts (%s).\n",
+				$composer['classmap_authoritative'] ? 'true' : 'false',
+				$composer['applied'] ? 'applied' : ($dryRun ? 'planned' : 'not applied')
+			);
+		}
 		$out .= \sprintf("\nResult: %s (exit %d)\n", $this->summaryLabel($exit, $dryRun), $exit);
 
 		\fwrite(\STDOUT, $out);
 	}
 
-	private function emitJson(array $result, int $exit): void {
+	protected function emitJson(array $result, int $exit): void {
 		$packages = [];
 		foreach ((array)($result['packages'] ?? []) as $pkg) {
 			$files = [];
@@ -373,6 +454,7 @@ abstract class AbstractWriteCommand {
 					'applied'     => (string)($file['applied'] ?? ''),
 					'backup_path' => isset($file['backup_path']) ? (string)$file['backup_path'] : null,
 					'new_path'    => isset($file['new_path']) ? (string)$file['new_path'] : null,
+					'error_type'  => isset($file['error_type']) ? (string)$file['error_type'] : null,
 					'error'       => isset($file['error']) ? (string)$file['error'] : null,
 				];
 			}
@@ -390,13 +472,15 @@ abstract class AbstractWriteCommand {
 			'dry_run'       => (bool)($result['dry_run'] ?? false),
 			'backup_dir'    => $result['backup_dir'] ?? null,
 			'state_written' => (bool)($result['state_written'] ?? false),
+			'environment'   => isset($result['environment']) ? (string)$result['environment'] : null,
+			'composer'      => isset($result['composer']) && \is_array($result['composer']) ? $result['composer'] : null,
 			'packages'      => $packages,
 		];
 
 		\fwrite(\STDOUT, InstallerCli::encodeJson($payload) . "\n");
 	}
 
-	private function summaryLabel(int $exit, bool $dryRun): string {
+	protected function summaryLabel(int $exit, bool $dryRun): string {
 		$label = match ($exit) {
 			0       => 'ok',
 			4       => 'conflicts / manual action required',
@@ -410,7 +494,7 @@ abstract class AbstractWriteCommand {
 	// Early returns (no plan was applied)
 	// ----------------------------------------------------------------
 
-	private function emptyResult(string $format, ?string $package): int {
+	protected function emptyResult(string $format, ?string $package): int {
 		if ($package !== null) {
 			return $this->fail($format, "Package '{$package}' is not installed or has no CitOmni scaffold manifest.", ExitCode::GENERAL_ERROR->value);
 		}
@@ -427,7 +511,7 @@ abstract class AbstractWriteCommand {
 		return ExitCode::OK->value;
 	}
 
-	private function fail(string $format, string $message, int $exit): int {
+	protected function fail(string $format, string $message, int $exit): int {
 		if ($format === 'json') {
 			\fwrite(\STDOUT, InstallerCli::encodeJson([
 				'ok'        => false,

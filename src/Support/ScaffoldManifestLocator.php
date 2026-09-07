@@ -15,60 +15,43 @@ declare(strict_types=1);
 
 namespace CitOmni\Installer\Support;
 
+use CitOmni\Installer\Enum\Environment;
+use CitOmni\Installer\State\ScaffoldState;
 use CitOmni\Installer\Util\Path;
 use CitOmni\Installer\Exception\InstallerException;
 
 /**
- * Locates and validates package scaffold manifests (contract §4).
+ * Locates, validates, and environment-normalizes package scaffold manifests.
  *
- * Formerly ComposerPackageLocator. The Composer-metadata half (reading installed.json,
- * resolving install paths and versions) now lives in ComposerPackageDiscovery, which this
- * class consumes. What remains here is exactly the scaffold-specific concern: for each
- * installed package, find its scaffold manifest, evaluate it, and validate it into normalized
- * data. The public surface (forAppRoot / discover / discoverPackage) is unchanged, so callers
- * only swap the type name.
+ * Discovery remains read-only. Source-only entries are normalized immediately.
+ * Environment-aware entries are fully validated during discovery, but their source
+ * is selected only through selectEnvironment(), before BuildScaffoldPlan sees them.
  *
- * Strictly read-only: never runs Composer, never mutates composer.json/composer.lock, never
- * writes to disk.
- *
- * Location (per §4):
- * - Per package, the manifest is located at extra.citomni.scaffold (package-relative path) if
- *   declared, else the convention install/manifest.php. A declared extra path wins and is
- *   required to exist; a package with neither is simply skipped (no scaffold).
- *
- * Validation (per §4):
- * - Manifest `package` MUST equal the Composer package name.
- * - Manifest `version` (schema version, not semver) MUST be a known value; unknown -> error.
- * - Each file needs string target/source/type/policy; policy MUST be a known policy.
- * - Path safety via PathGuard: every target resolves under app-root, every source under
- *   package-root; "..", absolute, drive-letter, UNC and stream-wrapper paths are rejected.
- * - Duplicate targets within a manifest -> error.
- *
- * Notes:
- * - App-root-aware (via the injected PathGuard) and instantiated explicitly. Not a service.
- * - Manifests are PHP files evaluated via include; parse/runtime failures become InstallerException.
+ * Manifest schema:
+ * - Version 1 remains valid for source-only manifests already used by CitOmni packages.
+ * - Version 2 adds the `environments` file shape.
+ * - A file declares exactly one of `source` or `environments`.
+ * - Environment-aware files must cover every Environment value exactly and must use
+ *   policy `managed`.
  */
 final class ScaffoldManifestLocator {
 
-	/** Manifest SCHEMA versions this installer understands. */
-	private const MANIFEST_SCHEMA_VERSIONS = [1];
+	/** Manifest schema versions this installer understands. */
+	private const MANIFEST_SCHEMA_VERSIONS = [1, 2];
 
 	/** Convention manifest location, relative to a package root. */
 	private const CONVENTION_MANIFEST = 'install/manifest.php';
 
-	/** Known file policies (contract §8). */
+	/** Known file policies. */
 	private const KNOWN_POLICIES = ['managed', 'create-only'];
 
-	/** Installed-package metadata source. */
 	private ComposerPackageDiscovery $discovery;
-
-	/** Path safety guard (carries the app-root). */
 	private PathGuard $pathGuard;
 
 
 	/**
-	 * @param  ComposerPackageDiscovery $discovery  Installed-package metadata source.
-	 * @param  PathGuard                $pathGuard  Guard constructed with the application root.
+	 * @param ComposerPackageDiscovery $discovery Installed-package metadata source.
+	 * @param PathGuard $pathGuard Guard constructed with the application root.
 	 */
 	public function __construct(ComposerPackageDiscovery $discovery, PathGuard $pathGuard) {
 		$this->discovery = $discovery;
@@ -79,9 +62,8 @@ final class ScaffoldManifestLocator {
 	/**
 	 * Build a locator for the conventional vendor/ directory under an application root.
 	 *
-	 * @param  string $appRoot  Application root (must exist).
+	 * @param string $appRoot Application root.
 	 * @return self
-	 * @throws InstallerException  If the application root cannot be resolved.
 	 */
 	public static function forAppRoot(string $appRoot): self {
 		$appRoot = \rtrim($appRoot, "/\\");
@@ -93,8 +75,11 @@ final class ScaffoldManifestLocator {
 	/**
 	 * Discover and validate every installed package that ships a scaffold manifest.
 	 *
-	 * @return array<string,array<string,mixed>>  Normalized manifests keyed by package name.
-	 * @throws InstallerException  If installed.json is missing/unreadable or any manifest is invalid.
+	 * Environment-aware entries remain in validated `environments` form until an
+	 * explicit environment is selected with selectEnvironment().
+	 *
+	 * @return array<string,array<string,mixed>> Manifests keyed by package name.
+	 * @throws InstallerException When Composer metadata or a manifest is invalid.
 	 */
 	public function discover(): array {
 		$out = [];
@@ -108,46 +93,177 @@ final class ScaffoldManifestLocator {
 			$out[$name] = $this->loadManifest($name, $info['root'], $manifestPath, $info['version']);
 		}
 
+		$this->assertUniqueTargets($out);
 		return $out;
 	}
 
 
 	/**
-	 * Discover and validate a single package's scaffold manifest.
+	 * Discover and validate one package's scaffold manifest.
 	 *
-	 * @param  string $name  Composer package name (vendor/name).
-	 * @return array<string,mixed>|null  Normalized manifest, or null if the package is not
-	 *                                   installed or ships no scaffold manifest.
-	 * @throws InstallerException  If the manifest exists but is invalid.
+	 * @param string $name Composer package name.
+	 * @return array<string,mixed>|null Manifest, or null when the package has none.
+	 * @throws InstallerException When Composer metadata or the manifest is invalid.
 	 */
 	public function discoverPackage(string $name): ?array {
-		$packages = $this->discovery->installedPackages();
-		if (!isset($packages[$name])) {
-			return null;
+		// Validate global ownership before a package filter can hide a collision.
+		return $this->discover()[$name] ?? null;
+	}
+
+
+	/**
+	 * Reject competing owners and file/directory collisions before any filtering.
+	 *
+	 * Resolved identities also detect aliases through symlinks. Windows uses a
+	 * conservative case-insensitive comparison, including targets not yet created.
+	 *
+	 * @param array<string,array<string,mixed>> $manifests Complete discovered manifests.
+	 * @return void
+	 * @throws InstallerException When targets overlap or claim installer metadata.
+	 */
+	private function assertUniqueTargets(array $manifests): void {
+		$reserved = [];
+		foreach ([ScaffoldState::RELATIVE_PATH, InstallerLock::RELATIVE_PATH, 'var/backups/citomni-installer'] as $path) {
+			$reserved[] = $this->pathGuard->resolveTarget($path);
+		}
+		$caseInsensitive = \PHP_OS_FAMILY === 'Windows';
+		$owners = [];
+		foreach ($manifests as $name => $manifest) {
+			foreach ($manifest['files'] as $file) {
+				$key = \str_replace('\\', '/', $file['target_path']);
+				if (\PHP_OS_FAMILY === 'Windows') {
+					$key = \strtolower($key);
+				}
+				foreach ($reserved as $path) {
+					if (Path::isInside($path, $key, $caseInsensitive) || Path::isInside($key, $path, $caseInsensitive)) {
+						throw new InstallerException('Scaffold target claims installer metadata: ' . $file['target']);
+					}
+				}
+				if (isset($owners[$key])) {
+					throw new InstallerException(\sprintf('Scaffold target %s has competing owners: %s and %s.', $file['target'], $owners[$key], $name));
+				}
+				$owners[$key] = $name . ' (' . $file['target'] . ')';
+			}
+		}
+		foreach ($owners as $key => $owner) {
+			$parent = \dirname($key);
+			while ($parent !== '.' && $parent !== \dirname($parent)) {
+				if (isset($owners[$parent])) {
+					throw new InstallerException('Scaffold file/directory collision between ' . $owners[$parent] . ' and ' . $owner . '.');
+				}
+				$parent = \dirname($parent);
+			}
+		}
+	}
+
+
+	/**
+	 * Return whether any discovered manifest contains an environment-aware file.
+	 *
+	 * @param array<string,array<string,mixed>> $manifests Discovered manifests.
+	 * @return bool
+	 */
+	public function hasEnvironmentAwareEntries(array $manifests): bool {
+		foreach ($manifests as $manifest) {
+			foreach ((array)($manifest['files'] ?? []) as $file) {
+				if (isset($file['environments']) && \is_array($file['environments'])) {
+					return true;
+				}
+			}
 		}
 
-		$info         = $packages[$name];
-		$manifestPath = $this->locateManifest($name, $info['root'], $info['extra']);
-		if ($manifestPath === null) {
-			return null;
+		return false;
+	}
+
+
+	/**
+	 * Select one environment and normalize manifests for BuildScaffoldPlan.
+	 *
+	 * Environment-aware entries are reduced to the same source/source_path shape as
+	 * ordinary entries. The internal `_environment_aware` marker lets command-specific
+	 * planning distinguish authoritative targets without exposing the raw manifest map.
+	 *
+	 * @param array<string,array<string,mixed>> $manifests Discovered manifests.
+	 * @param Environment $environment Environment whose sources should be selected.
+	 * @param bool $environmentOnly When true, drop source-only entries entirely.
+	 * @return array<string,array<string,mixed>> Planner-ready manifests.
+	 */
+	public function selectEnvironment(array $manifests, Environment $environment, bool $environmentOnly = false): array {
+		$out = [];
+
+		foreach ($manifests as $pkgName => $manifest) {
+			$files = [];
+
+			foreach ((array)($manifest['files'] ?? []) as $file) {
+				if (isset($file['environments']) && \is_array($file['environments'])) {
+					$selected = $file['environments'][$environment->value] ?? null;
+					if (!\is_array($selected)) {
+						throw new InstallerException(\sprintf(
+							'Manifest normalization failed for %s target %s: environment %s is missing.',
+							(string)$pkgName,
+							(string)($file['target'] ?? ''),
+							$environment->value
+						));
+					}
+
+					$normalized = $file;
+					unset($normalized['environments']);
+					$normalized['source'] = $selected['source'];
+					$normalized['source_path'] = $selected['source_path'];
+					$normalized['_environment_aware'] = true;
+					$files[] = $normalized;
+					continue;
+				}
+
+				if (!$environmentOnly) {
+					$files[] = $file;
+				}
+			}
+
+			if ($environmentOnly && $files === []) {
+				continue;
+			}
+
+			$copy = $manifest;
+			$copy['files'] = $files;
+			$out[$pkgName] = $copy;
 		}
 
-		return $this->loadManifest($name, $info['root'], $manifestPath, $info['version']);
+		return $out;
+	}
+
+
+	/**
+	 * Normalize manifests only when no environment-aware files exist.
+	 *
+	 * This explicit helper is useful for read-only flows that can legitimately run
+	 * without an environment. It refuses to silently discard environment-aware entries.
+	 *
+	 * @param array<string,array<string,mixed>> $manifests Discovered manifests.
+	 * @return array<string,array<string,mixed>> Planner-ready source-only manifests.
+	 * @throws InstallerException When an environment-aware entry requires a choice.
+	 */
+	public function selectEnvironmentAgnostic(array $manifests): array {
+		if ($this->hasEnvironmentAwareEntries($manifests)) {
+			throw new InstallerException('An explicit or recorded environment is required to normalize environment-aware scaffold manifests.');
+		}
+
+		return $manifests;
 	}
 
 
 	// ----------------------------------------------------------------
-	// Manifest location & validation
+	// Manifest location and validation
 	// ----------------------------------------------------------------
 
 	/**
-	 * Locate a package's manifest: declared extra path (must exist) else convention (if present).
+	 * Locate a package manifest through Composer extra or convention.
 	 *
-	 * @param  string              $name
-	 * @param  string              $root   Absolute package root.
-	 * @param  array<string,mixed> $extra  Package `extra` block.
-	 * @return string|null  Absolute manifest path, or null if the package ships no scaffold.
-	 * @throws InstallerException  If the declared extra path is unsafe or points at a missing file.
+	 * @param string $name Package name.
+	 * @param string $root Absolute package root.
+	 * @param array<string,mixed> $extra Composer extra block.
+	 * @return string|null Absolute manifest path, or null when absent.
+	 * @throws InstallerException When a declared path is invalid or missing.
 	 */
 	private function locateManifest(string $name, string $root, array $extra): ?string {
 		$declared = $extra['citomni']['scaffold'] ?? null;
@@ -179,7 +295,6 @@ final class ScaffoldManifestLocator {
 			return $abs;
 		}
 
-		// Convention path is constant and safe; resolveSource still confirms it stays under root.
 		$abs = $this->pathGuard->resolveSource($root, self::CONVENTION_MANIFEST);
 
 		return \is_file($abs) ? $abs : null;
@@ -187,14 +302,14 @@ final class ScaffoldManifestLocator {
 
 
 	/**
-	 * Evaluate and validate a manifest file into a normalized structure.
+	 * Evaluate and validate one scaffold manifest.
 	 *
-	 * @param  string $name
-	 * @param  string $root              Absolute package root.
-	 * @param  string $manifestPath      Absolute manifest path.
-	 * @param  string $installedVersion  Composer version (metadata only).
+	 * @param string $name Package name.
+	 * @param string $root Absolute package root.
+	 * @param string $manifestPath Absolute manifest path.
+	 * @param string $installedVersion Composer package version.
 	 * @return array<string,mixed>
-	 * @throws InstallerException
+	 * @throws InstallerException When the manifest is invalid.
 	 */
 	private function loadManifest(string $name, string $root, string $manifestPath, string $installedVersion): array {
 		try {
@@ -237,10 +352,11 @@ final class ScaffoldManifestLocator {
 			throw new InstallerException(\sprintf('Scaffold manifest for %s is missing a valid "files" array: %s', $name, $manifestPath));
 		}
 
-		$normalized  = [];
+		$normalized = [];
 		$seenTargets = [];
+
 		foreach ($files as $index => $file) {
-			$entry = $this->validateFile($name, $root, $manifestPath, $index, $file);
+			$entry = $this->validateFile($name, $root, $manifestPath, $version, $index, $file);
 
 			if (isset($seenTargets[$entry['target']])) {
 				throw new InstallerException(\sprintf(
@@ -250,8 +366,8 @@ final class ScaffoldManifestLocator {
 					$manifestPath
 				));
 			}
-			$seenTargets[$entry['target']] = true;
 
+			$seenTargets[$entry['target']] = true;
 			$normalized[] = $entry;
 		}
 
@@ -267,22 +383,28 @@ final class ScaffoldManifestLocator {
 
 
 	/**
-	 * Validate one manifest file entry and resolve its target/source paths.
+	 * Validate one manifest file entry and resolve all declared paths.
 	 *
-	 * @param  string     $name
-	 * @param  string     $root          Absolute package root.
-	 * @param  string     $manifestPath
-	 * @param  int|string $index         File index within the manifest (for diagnostics).
-	 * @param  mixed      $file
-	 * @return array{target:string,target_path:string,source:string,source_path:string,type:string,policy:string}
-	 * @throws InstallerException
+	 * @param string $name Package name.
+	 * @param string $root Absolute package root.
+	 * @param string $manifestPath Absolute manifest path.
+	 * @param int $schemaVersion Manifest schema version.
+	 * @param int|string $index File index for diagnostics.
+	 * @param mixed $file File declaration.
+	 * @return array<string,mixed> Validated file entry.
+	 * @throws InstallerException When the declaration is invalid.
 	 */
-	private function validateFile(string $name, string $root, string $manifestPath, int|string $index, mixed $file): array {
+	private function validateFile(string $name, string $root, string $manifestPath, int $schemaVersion, int|string $index, mixed $file): array {
 		if (!\is_array($file)) {
-			throw new InstallerException(\sprintf('Scaffold manifest for %s has a non-array file entry at [%s]: %s', $name, (string)$index, $manifestPath));
+			throw new InstallerException(\sprintf(
+				'Scaffold manifest for %s has a non-array file entry at [%s]: %s',
+				$name,
+				(string)$index,
+				$manifestPath
+			));
 		}
 
-		foreach (['target', 'source', 'type', 'policy'] as $key) {
+		foreach (['target', 'type', 'policy'] as $key) {
 			if (!isset($file[$key]) || !\is_string($file[$key]) || $file[$key] === '') {
 				throw new InstallerException(\sprintf(
 					'Scaffold manifest for %s file [%s] is missing a valid string "%s": %s',
@@ -292,6 +414,17 @@ final class ScaffoldManifestLocator {
 					$manifestPath
 				));
 			}
+		}
+
+		$hasSource = \array_key_exists('source', $file);
+		$hasEnvironments = \array_key_exists('environments', $file);
+		if ($hasSource === $hasEnvironments) {
+			throw new InstallerException(\sprintf(
+				'Scaffold manifest for %s file [%s] must declare exactly one of "source" or "environments": %s',
+				$name,
+				(string)$index,
+				$manifestPath
+			));
 		}
 
 		$policy = $file['policy'];
@@ -312,20 +445,119 @@ final class ScaffoldManifestLocator {
 			throw new InstallerException(\sprintf('Scaffold manifest for %s has an invalid target: %s', $name, $e->getMessage()), 0, $e);
 		}
 
-		try {
-			$sourcePath = $this->pathGuard->resolveSource($root, $file['source']);
-		} catch (InstallerException $e) {
-			throw new InstallerException(\sprintf('Scaffold manifest for %s has an invalid source: %s', $name, $e->getMessage()), 0, $e);
-		}
-
-		return [
+		$base = [
 			'target'      => Path::normalizeRelative($file['target']),
 			'target_path' => $targetPath,
-			'source'      => Path::normalizeRelative($file['source']),
-			'source_path' => $sourcePath,
 			'type'        => $file['type'],
 			'policy'      => $policy,
 		];
-	}
 
+		if ($hasSource) {
+			if (!\is_string($file['source']) || $file['source'] === '') {
+				throw new InstallerException(\sprintf(
+					'Scaffold manifest for %s file [%s] is missing a valid string "source": %s',
+					$name,
+					(string)$index,
+					$manifestPath
+				));
+			}
+
+			try {
+				$sourcePath = $this->pathGuard->resolveSource($root, $file['source']);
+			} catch (InstallerException $e) {
+				throw new InstallerException(\sprintf('Scaffold manifest for %s has an invalid source: %s', $name, $e->getMessage()), 0, $e);
+			}
+
+			return $base + [
+				'source'      => Path::normalizeRelative($file['source']),
+				'source_path' => $sourcePath,
+			];
+		}
+
+		if ($schemaVersion < 2) {
+			throw new InstallerException(\sprintf(
+				'Scaffold manifest for %s file [%s] uses "environments", which requires schema version 2: %s',
+				$name,
+				(string)$index,
+				$manifestPath
+			));
+		}
+
+		if ($policy !== 'managed') {
+			throw new InstallerException(\sprintf(
+				'Scaffold manifest for %s file [%s] is environment-aware and must use policy "managed": %s',
+				$name,
+				(string)$index,
+				$manifestPath
+			));
+		}
+
+		if (!\is_array($file['environments'])) {
+			throw new InstallerException(\sprintf(
+				'Scaffold manifest for %s file [%s] has invalid "environments"; expected an array: %s',
+				$name,
+				(string)$index,
+				$manifestPath
+			));
+		}
+
+		$expected = Environment::values();
+		$actual = \array_keys($file['environments']);
+		\sort($expected, \SORT_STRING);
+		\sort($actual, \SORT_STRING);
+
+		if ($actual !== $expected) {
+			throw new InstallerException(\sprintf(
+				'Scaffold manifest for %s file [%s] must define exactly these environments: %s: %s',
+				$name,
+				(string)$index,
+				\implode(', ', Environment::values()),
+				$manifestPath
+			));
+		}
+
+		$environments = [];
+		foreach (Environment::cases() as $environment) {
+			$definition = $file['environments'][$environment->value];
+			if (!\is_array($definition) || \array_keys($definition) !== ['source']) {
+				throw new InstallerException(\sprintf(
+					'Scaffold manifest for %s file [%s] environment %s must contain exactly one "source" entry: %s',
+					$name,
+					(string)$index,
+					$environment->value,
+					$manifestPath
+				));
+			}
+
+			$source = $definition['source'];
+			if (!\is_string($source) || $source === '') {
+				throw new InstallerException(\sprintf(
+					'Scaffold manifest for %s file [%s] environment %s has an invalid source: %s',
+					$name,
+					(string)$index,
+					$environment->value,
+					$manifestPath
+				));
+			}
+
+			try {
+				$sourcePath = $this->pathGuard->resolveSource($root, $source);
+			} catch (InstallerException $e) {
+				throw new InstallerException(\sprintf(
+					'Scaffold manifest for %s file [%s] has an invalid %s source: %s',
+					$name,
+					(string)$index,
+					$environment->value,
+					$e->getMessage()
+				), 0, $e);
+			}
+
+			$environments[$environment->value] = [
+				'source'      => Path::normalizeRelative($source),
+				'source_path' => $sourcePath,
+			];
+		}
+
+		return $base + ['environments' => $environments];
+	}
 }

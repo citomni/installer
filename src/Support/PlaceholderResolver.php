@@ -45,6 +45,12 @@ final class PlaceholderResolver {
 
 	private const CONFIG_RELATIVE_PATH = 'config/citomni_installer.php';
 
+	/** Derived placeholders keyed by derived host => canonical root URL source. */
+	private const DERIVED_ROOT_HOSTS = [
+		'PROD_ROOT_HOST' => 'PROD_ROOT_URL',
+		'STAGE_ROOT_HOST' => 'STAGE_ROOT_URL',
+	];
+
 	private string $appRoot;
 
 
@@ -90,12 +96,76 @@ final class PlaceholderResolver {
 		$configPlaceholders = $this->loadConfigPlaceholders();
 		$overridePlaceholders = $this->validatedPlaceholderMap($cliOverrides, 'CLI overrides');
 
+		$this->assertNoDerivedHostInputs($configPlaceholders, 'installer config');
+		$this->assertNoDerivedHostInputs($overridePlaceholders, 'CLI overrides');
+
 		$resolved = \array_replace($configPlaceholders, $overridePlaceholders);
+		$this->deriveRootHosts($resolved);
 		\ksort($resolved, \SORT_STRING);
 
 		return $resolved;
 	}
 
+
+
+	/**
+	 * Reject direct inputs for derived ROOT_HOST placeholders.
+	 *
+	 * @param array<string,string> $placeholders Validated placeholder map.
+	 * @param string $source Human-readable source name.
+	 * @return void
+	 * @throws InstallerException When a derived host is supplied directly.
+	 */
+	private function assertNoDerivedHostInputs(array $placeholders, string $source): void {
+		foreach (self::DERIVED_ROOT_HOSTS as $hostKey => $urlKey) {
+			if (!\array_key_exists($hostKey, $placeholders)) {
+				continue;
+			}
+
+			throw new InstallerException(\sprintf(
+				'Placeholder {{%s}} is derived from {{%s}} and must not be configured directly in %s.',
+				$hostKey,
+				$urlKey,
+				$source
+			));
+		}
+	}
+
+
+	/**
+	 * Derive ROOT_HOST placeholders from the final root URL values.
+	 *
+	 * CLI root URL overrides have already been applied when this method runs, so the
+	 * host always corresponds to the exact URL that will be used for rendering.
+	 *
+	 * @param array<string,string> $resolved Final placeholder map, modified in place.
+	 * @return void
+	 * @throws InstallerException When a non-empty root URL has no parseable host.
+	 */
+	private function deriveRootHosts(array &$resolved): void {
+		foreach (self::DERIVED_ROOT_HOSTS as $hostKey => $urlKey) {
+			if (!\array_key_exists($urlKey, $resolved)) {
+				continue;
+			}
+
+			$url = $resolved[$urlKey];
+			if ($url === '') {
+				$resolved[$hostKey] = '';
+				continue;
+			}
+
+			$host = \parse_url(\trim($url), \PHP_URL_HOST);
+			if (!\is_string($host) || $host === '') {
+				throw new InstallerException(\sprintf(
+					'Placeholder {{%s}} must be an absolute URL with a host so {{%s}} can be derived.',
+					$urlKey,
+					$hostKey
+				));
+			}
+
+			$resolved[$hostKey] = \strtolower($host);
+		}
+	}
 
 	/**
 	 * Load placeholder values from the app-local installer config.
