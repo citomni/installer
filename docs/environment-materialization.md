@@ -1,7 +1,8 @@
 # Environment materialization and failure recovery
 
 This describes the explicit-environment implementation and its hardening changes.
-It uses state format 2 without migration or fallback for older state files.
+Normal lifecycle commands use strict state format 2 without fallback. The explicit
+`migrate` command can replace known v1 materialization from current manifests.
 
 ## Commands
 
@@ -9,6 +10,8 @@ Run commands from the application root after Composer has installed its packages
 
 ```sh
 vendor/bin/citomni-installer install --environment=dev
+vendor/bin/citomni-installer migrate --environment=dev --dry-run
+vendor/bin/citomni-installer migrate --environment=dev
 vendor/bin/citomni-installer environment stage --dry-run
 vendor/bin/citomni-installer environment stage
 vendor/bin/citomni-installer environment prod
@@ -18,6 +21,14 @@ vendor/bin/citomni-installer environment dev
 The initial install must include all discovered scaffold packages. A package filter
 cannot establish a global environment. Later installs may use `--package` with the
 recorded environment. `install --force` cannot switch an existing environment.
+
+
+The `migrate` command is an explicit recovery path for legacy materialization. It
+ignores legacy package/file baselines and uses the currently installed manifests and
+current placeholder resolution as the authority. Existing create-only targets are
+preserved. Managed targets are adopted when current or backed up and replaced when
+they differ. A known v1 state is backed up and removed before current v2 state is
+committed. Missing state is accepted so an interrupted migration can be resumed.
 
 The `environment` command selects only environment-aware manifest entries. It
 replaces differing bytes with the selected environment's rendering and backs up

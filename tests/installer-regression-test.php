@@ -508,6 +508,72 @@ $tests['apply IO failures map to exit 6 and unknown status packages fail'] = sta
 	[$exit] = command($app, ['status', '--package=test/missing']);
 	check($exit !== 0, 'Unknown status package falsely succeeded.');
 };
+$tests['migrate rebuilds legacy materialization from current manifests'] = static function () use ($base): void {
+	$app = fixture($base, 'migrate-legacy');
+	put($app . '/public/environment.txt', "legacy dev\n");
+	put($app . '/bin/tool', "legacy tool\n");
+	$customConfig = "<?php return ['name' => 'local custom'];\n";
+	put($app . '/config/app.php', $customConfig);
+	$legacyState = [
+		'format_version' => 1,
+		'generated_by' => 'citomni/installer',
+		'generated_at' => '2026-01-01T00:00:00+00:00',
+		'packages' => ['obsolete/package' => ['files' => ['obsolete.txt' => ['policy' => 'managed']]]],
+	];
+	$statePath = $app . '/' . ScaffoldState::RELATIVE_PATH;
+	put($statePath, '<?php return ' . var_export($legacyState, true) . ';');
+	$legacyStateBytes = file_get_contents($statePath);
+
+	[$exit, $result, $output] = command($app, ['migrate', '--environment=dev']);
+	check($exit === 0, 'Legacy migration failed. ' . $output);
+	check(file_get_contents($app . '/public/environment.txt') === "dev\n", 'Migration did not refresh the environment-aware target.');
+	check(file_get_contents($app . '/bin/tool') === "tool version 1\n", 'Migration did not refresh an ordinary managed target.');
+	check(file_get_contents($app . '/config/app.php') === $customConfig, 'Migration overwrote an existing create-only target.');
+
+	$state = ScaffoldState::forAppRoot($app);
+	check($state->environment() === Environment::DEV, 'Migration did not commit v2 dev state.');
+	$validated = $state->read();
+	check(($validated['format_version'] ?? null) === ScaffoldState::FORMAT_VERSION, 'Migration did not write the current state format.');
+	check(!isset($validated['packages']['obsolete/package']), 'Migration copied obsolete legacy package state into v2.');
+
+	$stateBackup = (string)$result['backup_dir'] . '/' . ScaffoldState::RELATIVE_PATH;
+	check(is_file($stateBackup), 'Migration did not back up legacy state.');
+	check(file_get_contents($stateBackup) === $legacyStateBytes, 'Legacy state backup bytes differ from the original.');
+	check(is_file((string)$result['backup_dir'] . '/public/environment.txt'), 'Migration did not back up the replaced environment target.');
+	check(is_file((string)$result['backup_dir'] . '/bin/tool'), 'Migration did not back up the replaced managed target.');
+};
+
+$tests['migrate dry-run is read-only and interrupted migration can resume without state'] = static function () use ($base): void {
+	$app = fixture($base, 'migrate-dry-run');
+	put($app . '/public/environment.txt', "legacy dev\n");
+	put($app . '/bin/tool', "legacy tool\n");
+	$statePath = $app . '/' . ScaffoldState::RELATIVE_PATH;
+	put($statePath, "<?php return ['format_version' => 1, 'generated_by' => 'citomni/installer', 'packages' => []];");
+	$beforeState = file_get_contents($statePath);
+	$beforeComposer = file_get_contents($app . '/composer.json');
+
+	[$exit, $result, $output] = command($app, ['migrate', '--environment=dev', '--dry-run']);
+	check($exit === 0, 'Migration dry-run failed. ' . $output);
+	check(file_get_contents($statePath) === $beforeState, 'Migration dry-run changed legacy state.');
+	check(file_get_contents($app . '/public/environment.txt') === "legacy dev\n", 'Migration dry-run changed scaffold.');
+	check(file_get_contents($app . '/composer.json') === $beforeComposer, 'Migration dry-run changed Composer posture.');
+	check(!is_dir((string)$result['backup_dir']), 'Migration dry-run created the planned backup directory.');
+
+	unlink($statePath);
+	[$exit, , $output] = command($app, ['migrate', '--environment=dev']);
+	check($exit === 0, 'Migration could not resume after legacy state was already removed. ' . $output);
+	check(ScaffoldState::forAppRoot($app)->environment() === Environment::DEV, 'Resumed migration did not commit current state.');
+};
+
+$tests['migrate rejects an already current application'] = static function () use ($base): void {
+	$app = fixture($base, 'migrate-current');
+	installed($app);
+	$before = file_get_contents(ScaffoldState::forAppRoot($app)->path());
+	[$exit] = command($app, ['migrate', '--environment=dev']);
+	check($exit === 4, 'Migration accepted an already-current v2 application.');
+	check(file_get_contents(ScaffoldState::forAppRoot($app)->path()) === $before, 'Rejected migration changed current state.');
+};
+
 $tests['state format and environment-switch boundaries remain strict'] = static function () use ($base): void {
 	$app = fixture($base, 'boundaries');
 	$state = installed($app);

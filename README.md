@@ -66,6 +66,7 @@ No smoke, no mirrors, and preferably no wizard hat in production.
 - `doctor` for read-only environment validation.
 - `status` for read-only scaffold status.
 - `install --environment=<dev|stage|prod>` for initial scaffold and Composer materialization.
+- `migrate --environment=<dev|stage|prod>` for rebuilding legacy materialization from current manifests while preserving create-only files.
 - `environment <dev|stage|prod>` for authoritative switching of environment-aware targets.
 - `repair` for recreating missing scaffold files from recorded state using the currently installed package stub and the recorded placeholder snapshot.
 - `sync` for controlled updates of managed scaffold files.
@@ -398,6 +399,35 @@ vendor/bin/citomni-installer install --environment=dev --package=citomni/http --
 ```
 
 `--force` allows existing scaffold targets to be overwritten, but asks for interactive confirmation before writing. `--force=yes` confirms the overwrite without prompting and is intended for scripts or explicitly confirmed manual runs. Forced replacements create backups before writing.
+
+### `migrate`
+
+Rebuilds a legacy installer materialization from the currently installed package manifests. The legacy state file is not converted or used as the new baseline.
+
+Behavior:
+
+- Requires an explicit `--environment=<dev|stage|prod>`.
+- Uses current manifests and current placeholder resolution as the authority.
+- Preserves every existing `create-only` target.
+- Adopts an existing managed target when its bytes already match the current rendering.
+- Backs up and replaces an existing managed target when its bytes differ.
+- Creates missing current-manifest targets.
+- Backs up a known v1 installer state before removing it.
+- Accepts missing state so an interrupted migration can be resumed.
+- Applies Composer environment posture and commits new v2 state only after scaffold and Composer succeed.
+- Rejects an application that already has current v2 state.
+
+Preview:
+
+```bash
+vendor/bin/citomni-installer migrate --environment=dev --dry-run
+```
+
+Apply:
+
+```bash
+vendor/bin/citomni-installer migrate --environment=dev
+```
 
 ### `repair`
 

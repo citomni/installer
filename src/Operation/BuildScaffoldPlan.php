@@ -82,7 +82,7 @@ final class BuildScaffoldPlan {
 	 * Commands that produce a plan. `doctor` is read-only validation and does
 	 * not flow through here.
 	 */
-	private const COMMANDS = ['status', 'install', 'sync', 'repair', 'environment'];
+	private const COMMANDS = ['status', 'install', 'migrate', 'sync', 'repair', 'environment'];
 
 	public function __construct(private readonly PathGuard $pathGuard, private readonly ScaffoldRenderer $renderer, private readonly ScaffoldState $state) {}
 
@@ -94,7 +94,7 @@ final class BuildScaffoldPlan {
 	/**
 	 * Build the plan for a command across the given (already discovered) manifests.
 	 *
-	 * @param  string                            $command       One of status|install|sync|repair|environment.
+	 * @param  string                            $command       One of status|install|migrate|sync|repair|environment.
 	 * @param  array<string,array<string,mixed>> $manifests     Keyed by package name. Each manifest:
 	 *                                                           ['package'=>string,'version'=>int,
 	 *                                                            'root'=>absolute-package-root,
@@ -118,8 +118,9 @@ final class BuildScaffoldPlan {
 			? Path::normalizeRelative($options['target'])
 			: null;
 
-		// Read-only baseline. Throws if the state file exists but is unsafe (contract §5).
-		$statePackages = $this->state->readPackages();
+		// Migration deliberately rebuilds state from current manifests and disk. Legacy
+		// state is only an eligibility/backup concern and is never a planning baseline.
+		$statePackages = $command === 'migrate' ? [] : $this->state->readPackages();
 
 		$packages = [];
 		foreach ($manifests as $pkgName => $manifest) {
@@ -312,6 +313,9 @@ final class BuildScaffoldPlan {
 				}
 				return $this->decideInstall($status, $force, $ctx);
 
+			case 'migrate':
+				return $this->decideMigrate($policy, $status, $environmentAware, $ctx);
+
 			case 'sync':
 				return $this->decideSync($policy, $status, $force, $ctx);
 
@@ -376,6 +380,51 @@ final class BuildScaffoldPlan {
 		}
 
 		return ['action' => 'none'];
+	}
+
+
+	/**
+	 * migrate: rebuild the current baseline without trusting legacy state.
+	 *
+	 * Existing create-only files are preserved exactly like a normal install. Managed
+	 * files are authoritative from the current manifest: matching bytes are adopted,
+	 * differing bytes are backed up and replaced, and missing files are created.
+	 *
+	 * @param string $policy File policy.
+	 * @param string $status Detected status with migration state intentionally ignored.
+	 * @param bool $environmentAware Whether this target was selected from an environment map.
+	 * @param array<string,mixed> $ctx Per-file planning context.
+	 * @return array<string,mixed>
+	 */
+	private function decideMigrate(string $policy, string $status, bool $environmentAware, array $ctx): array {
+		if ($policy === 'create-only') {
+			return $this->decideInstall($status, false, $ctx);
+		}
+
+		if ($status === 'missing') {
+			return $this->createWith($ctx, $ctx['pkgPlaceholders']);
+		}
+
+		$ck = $ctx['currentCk'] ?? $this->render($ctx['sourceAbs'], $ctx['pkgPlaceholders']);
+		$disk = (string)$ctx['disk'];
+
+		if (Checksum::matches($disk, $ck[1])) {
+			return [
+				'action' => 'register_state',
+				'reason' => $environmentAware ? 'adopt_environment_baseline' : 'adopt_clean_baseline',
+				'apply' => $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck),
+			];
+		}
+
+		$apply = $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck);
+		$apply['backup_required'] = true;
+
+		return [
+			'action' => 'update',
+			'backup' => true,
+			'reason' => 'migration_overwrite',
+			'apply' => $apply,
+		];
 	}
 
 

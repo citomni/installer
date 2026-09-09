@@ -19,6 +19,7 @@ use CitOmni\Installer\Cli\Command\DoctorCommand;
 use CitOmni\Installer\Cli\Command\EnvironmentCommand;
 use CitOmni\Installer\Cli\Command\StatusCommand;
 use CitOmni\Installer\Cli\Command\InstallCommand;
+use CitOmni\Installer\Cli\Command\MigrateCommand;
 use CitOmni\Installer\Cli\Command\RepairCommand;
 use CitOmni\Installer\Cli\Command\SyncCommand;
 use CitOmni\Installer\Enum\ExitCode;
@@ -35,7 +36,7 @@ use CitOmni\Installer\Support\InstallerLock;
 use CitOmni\Installer\Exception\InstallerException;
 
 /**
- * Minimal dispatcher for the installer commands (doctor, status, install, environment, repair, sync).
+ * Minimal dispatcher for the installer commands (doctor, status, install, migrate, environment, repair, sync).
  *
  * Responsibilities:
  * - Route argv to a command, or print usage/help.
@@ -54,7 +55,7 @@ use CitOmni\Installer\Exception\InstallerException;
 final class InstallerCli {
 
 	/** Commands handled by this layer. */
-	private const COMMANDS = ['doctor', 'status', 'install', 'environment', 'repair', 'sync'];
+	private const COMMANDS = ['doctor', 'status', 'install', 'migrate', 'environment', 'repair', 'sync'];
 
 	public function __construct(private readonly string $appRoot) {}
 
@@ -123,6 +124,7 @@ final class InstallerCli {
 					return (new StatusCommand($appRoot, $locator, $builder, $resolver, $state))->run($cmdArgs);
 
 				case 'install':
+				case 'migrate':
 				case 'environment':
 				case 'repair':
 				case 'sync':
@@ -131,7 +133,7 @@ final class InstallerCli {
 					$builder = new BuildScaffoldPlan($pathGuard, $renderer, $state);
 					$applier = new ApplyScaffoldPlan($pathGuard, $renderer, $state);
 
-					if ($name === 'install' || $name === 'environment') {
+					if ($name === 'install' || $name === 'migrate' || $name === 'environment') {
 						$materializer = new ApplyEnvironmentMaterialization(
 							$applier,
 							new ComposerRunner($appRoot),
@@ -141,6 +143,7 @@ final class InstallerCli {
 
 					$command = match ($name) {
 						'install' => new InstallCommand($locator, $builder, $applier, $resolver, $state, $lock, $materializer),
+						'migrate' => new MigrateCommand($locator, $builder, $applier, $resolver, $state, $lock, $materializer),
 						'environment' => new EnvironmentCommand($locator, $builder, $applier, $resolver, $state, $lock, $materializer),
 						'repair' => new RepairCommand($locator, $builder, $applier, $resolver, $state, $lock),
 						default => new SyncCommand($locator, $builder, $applier, $resolver, $state, $lock),
@@ -303,6 +306,7 @@ Commands:
   doctor    Validate environment, manifests, installer config and write access.
   status    Report scaffold state per package.
   install   Perform initial materialization for an explicit environment.
+  migrate   Rebuild legacy materialization from current manifests.
   environment  Switch environment-aware files and Composer posture.
   repair    Recreate missing files from recorded state.
   sync      Sync package-owned scaffold to the current baseline.
@@ -378,6 +382,26 @@ Use --dry-run to preview.
 Exit codes:
   0  applied / nothing to do   4  conflicts (existing files in the way)
   6  IO/permission error       1  error                  2  invalid usage
+
+
+TXT,
+			'migrate' => <<<TXT
+citomni-installer migrate — rebuild legacy materialization from current manifests
+
+Usage:
+  citomni-installer migrate --environment=<dev|stage|prod> [--format=text|json]
+                            [--placeholder=KEY=VALUE ...] [--dry-run]
+
+Uses the currently installed package manifests as the complete authority. Existing
+create-only targets are preserved. Managed targets are adopted when they already
+match the current rendering; differing managed targets are backed up and replaced.
+A known v1 state file is backed up and removed before the new v2 state is committed.
+A missing state is accepted so an interrupted migration can be resumed.
+
+Exit codes:
+  0  applied / nothing to do   4  already current / conflict
+  5  unsafe legacy state       6  IO/permission error
+  1  error                     2  invalid usage
 
 TXT,
 			'environment' => <<<TXT

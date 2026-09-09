@@ -117,27 +117,54 @@ final class ApplyScaffoldPlan {
 		$dryRun = (bool)($options['dry_run'] ?? false);
 		$persistState = (bool)($options['persist_state'] ?? true);
 		$command = (string)($plan['command'] ?? '');
+		$migration = $command === 'migrate';
 
-		// -- 1. Precondition: existing state must be readable before we touch anything ----
-		// readPackages() validates format_version and structure; an unsafe state throws here,
-		// guaranteeing no file is written when state cannot be trusted.
-		$statePackages = $this->state->readPackages();
+		// -- 1. Precondition: existing state must be safe before we touch anything --------
+		// Normal lifecycle commands require current state. Migration accepts only a known
+		// v1 state (or no state after an interrupted attempt) and rebuilds baselines from
+		// current manifests, never from the legacy package map.
+		$legacyVersion = $migration ? $this->state->legacyVersionForMigration() : null;
+		$statePackages = $migration ? [] : $this->state->readPackages();
 
 		$ts  = $this->timestamp();
 		$now = $this->nowIso8601();
 		$backupReserved = false;
-		if (!$dryRun) {
+		$needsBackupRoot = $legacyVersion !== null;
+		if (!$needsBackupRoot) {
 			foreach ($plan['packages'] as $package) {
 				foreach ($package['files'] as $file) {
 					if (!empty($file['_apply']['backup_required'])) {
-						$root = $this->pathGuard->resolveTarget('var/backups/' . self::BACKUP_NS . '/' . $ts);
-						// mkdir must create this run's leaf, never reuse an earlier run.
-						if (!@\mkdir($root, 0775, true)) {
-							throw new FilesystemException('Unable to reserve a unique backup directory: ' . $root);
-						}
-						$backupReserved = true;
+						$needsBackupRoot = true;
 						break 2;
 					}
+				}
+			}
+		}
+
+		if (!$dryRun && $needsBackupRoot) {
+			$root = $this->pathGuard->resolveTarget('var/backups/' . self::BACKUP_NS . '/' . $ts);
+			// mkdir must create this run's leaf, never reuse an earlier run.
+			if (!@\mkdir($root, 0775, true)) {
+				throw new FilesystemException('Unable to reserve a unique backup directory: ' . $root);
+			}
+			$backupReserved = true;
+		}
+
+		$stateBackupPath = null;
+		if ($legacyVersion !== null) {
+			$statePath = $this->state->path();
+			$stateBackupPath = $this->backupPathFor(ScaffoldState::RELATIVE_PATH, $ts);
+			if (!$dryRun) {
+				$legacyBytes = \file_get_contents($statePath);
+				if ($legacyBytes === false) {
+					throw new FilesystemException('Unable to read legacy state for backup: ' . $statePath);
+				}
+				$this->backupExisting($statePath, $stateBackupPath, Checksum::sha256($legacyBytes));
+				if (!@\unlink($statePath)) {
+					throw new FilesystemException('Unable to remove legacy state after backup: ' . $statePath);
+				}
+				if (\function_exists('opcache_invalidate')) {
+					@\opcache_invalidate($statePath, true);
 				}
 			}
 		}
@@ -190,7 +217,7 @@ final class ApplyScaffoldPlan {
 			'command'       => $command,
 			'dry_run'       => $dryRun,
 			'ok'            => $ok,
-			'backup_dir'    => ($anyBackup || $backupReserved) ? $this->backupRoot($ts) : null,
+			'backup_dir'    => ($anyBackup || $backupReserved || $stateBackupPath !== null) ? $this->backupRoot($ts) : null,
 			'state_written' => $stateWritten,
 			'packages'      => $resultPackages,
 		];
