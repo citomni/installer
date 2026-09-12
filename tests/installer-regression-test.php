@@ -283,6 +283,30 @@ $tests['conflicting ordinary managed file is not adopted'] = static function () 
 	check($exit === 4 && file_get_contents($app . '/bin/tool') === 'local file', 'Conflicting file was adopted or overwritten.');
 	check(!ScaffoldState::forAppRoot($app)->exists(), 'Conflict committed initial state.');
 };
+$tests['environment target contract exposes only environment materialization ownership'] = static function () use ($base): void {
+	$app = fixture($base, 'environment-targets');
+	package($app, 'test/other', [
+		['target' => 'config/environment-switch.php', 'type' => 'config', 'policy' => 'managed', 'environments' => [
+			'dev' => ['source' => 'install/dev.stub'],
+			'stage' => ['source' => 'install/stage.stub'],
+			'prod' => ['source' => 'install/prod.stub'],
+		]],
+		['target' => 'config/ordinary.php', 'source' => 'install/ordinary.stub', 'type' => 'config', 'policy' => 'managed'],
+	], [
+		'install/dev.stub' => "dev\n",
+		'install/stage.stub' => "stage\n",
+		'install/prod.stub' => "prod\n",
+		'install/ordinary.stub' => "ordinary\n",
+	]);
+
+	$locator = ScaffoldManifestLocator::forAppRoot($app);
+	$targets = $locator->environmentTargets($locator->discover());
+
+	check($targets === [
+		['package' => 'test/other', 'target' => 'config/environment-switch.php'],
+		['package' => 'test/core', 'target' => 'public/environment.txt'],
+	], 'Environment target contract was incomplete, included source-only files, or was not deterministic.');
+};
 $tests['global target collisions fail even behind a package filter'] = static function () use ($base): void {
 	$app = fixture($base, 'collision');
 	package($app, 'test/other', [['target' => 'bin/tool', 'source' => 'install/other.stub', 'type' => 'text', 'policy' => 'create-only']], ['install/other.stub' => 'other']);

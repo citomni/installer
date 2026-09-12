@@ -177,6 +177,49 @@ final class ScaffoldManifestLocator {
 
 
 	/**
+	 * Return every app target controlled by environment materialization.
+	 *
+	 * Behavior:
+	 * - Reads validated discovered manifests without selecting an environment.
+	 * - Includes only entries using the manifest `environments` shape.
+	 * - Returns package ownership with each normalized app-relative target.
+	 * - Sorts deterministically by target, then package.
+	 *
+	 * Notes:
+	 * - This is the public read-only contract for consumers that must avoid
+	 *   mutating files owned by environment switching.
+	 * - Call this with discover() output, before selectEnvironment() removes the
+	 *   public `environments` shape and adds internal planner metadata.
+	 *
+	 * @param array<string,array<string,mixed>> $manifests Discovered manifests.
+	 * @return array<int,array{package:string,target:string}> Environment-controlled targets.
+	 */
+	public function environmentTargets(array $manifests): array {
+		$targets = [];
+
+		foreach ($manifests as $package => $manifest) {
+			foreach ((array)($manifest['files'] ?? []) as $file) {
+				if (!isset($file['environments']) || !\is_array($file['environments'])) {
+					continue;
+				}
+
+				$targets[] = [
+					'package' => (string)$package,
+					'target' => (string)$file['target'],
+				];
+			}
+		}
+
+		\usort($targets, static function (array $a, array $b): int {
+			$targetCompare = \strcmp($a['target'], $b['target']);
+			return $targetCompare !== 0 ? $targetCompare : \strcmp($a['package'], $b['package']);
+		});
+
+		return $targets;
+	}
+
+
+	/**
 	 * Select one environment and normalize manifests for BuildScaffoldPlan.
 	 *
 	 * Environment-aware entries are reduced to the same source/source_path shape as
