@@ -367,8 +367,12 @@ abstract class AbstractWriteCommand {
 						$hasFailure = true;
 						break;
 					case 'conflict':
-					case 'wrote_new':
 						$hasConflict = true;
+						break;
+					case 'wrote_new':
+						$advisoryCreateOnly = (string)($result['command'] ?? '') === 'migrate'
+							&& (string)($file['policy'] ?? '') === 'create-only';
+						$hasConflict = $hasConflict || !$advisoryCreateOnly;
 						break;
 				}
 			}
@@ -445,7 +449,8 @@ abstract class AbstractWriteCommand {
 			$migration = $result['migration'];
 			$blocking = \count((array)($migration['blocking_manual_review'] ?? []));
 			$appSkeleton = \is_array($migration['app_skeleton'] ?? null) ? $migration['app_skeleton'] : [];
-			$advisory = \count((array)($appSkeleton['manual_review'] ?? []));
+			$advisoryScaffold = \count((array)($migration['advisory_manual_review'] ?? []));
+			$advisory = $advisoryScaffold + \count((array)($appSkeleton['manual_review'] ?? []));
 			$out .= \sprintf("\nMigration review: blocking=%d; advisory=%d.\n", $blocking, $advisory);
 			$phpLint = \is_array($migration['php_lint'] ?? null) ? $migration['php_lint'] : [];
 			if ($phpLint !== []) {

@@ -24,9 +24,10 @@ use CitOmni\Installer\Util\UnifiedDiff;
  * Compare app-owned root files with a pinned citomni/app-skeleton reference set.
  *
  * Behavior:
- * - .gitignore and .gitattributes are byte-compared with the current skeleton files.
- * - composer.json is also byte-compared, but is always advisory because real apps are
- *   expected to diverge and the installer manages classmap-authoritative by environment.
+ * - .gitignore, .gitattributes, and composer.json are text-compared after normalizing
+ *   line endings and ignoring one final newline difference.
+ * - composer.json remains advisory because real apps are expected to diverge and the
+ *   installer manages classmap-authoritative by environment.
  * - A differing or missing app-owned file is never replaced. The reference is written
  *   as `<target>.new` for human review.
  * - Generated `.new` reference sidecars are overwritten on every real run so they always represent the current pinned skeleton reference.
@@ -74,7 +75,10 @@ final class AuditAppSkeletonMigration {
 				}
 			}
 
-			if ($exists && $current === $desired) {
+			$currentComparable = $this->normalizeTextForComparison($current);
+			$desiredComparable = $this->normalizeTextForComparison($desired);
+
+			if ($exists && $currentComparable === $desiredComparable) {
 				$resultFiles[] = [
 					'target' => $target,
 					'status' => 'identical',
@@ -95,7 +99,7 @@ final class AuditAppSkeletonMigration {
 				'new_path' => $newAbs,
 				'sidecar_status' => $sidecarStatus,
 				'source_url' => $url,
-				'diff' => UnifiedDiff::create($current, $desired, $target, $target . '.new'),
+				'diff' => UnifiedDiff::create($currentComparable, $desiredComparable, $target, $target . '.new'),
 			];
 			$manual[] = [
 				'target' => $target,
@@ -115,6 +119,17 @@ final class AuditAppSkeletonMigration {
 		];
 	}
 
+
+	/**
+	 * Normalize app-skeleton text for human-review equality.
+	 *
+	 * CRLF/CR differences and the presence of one final newline are not actionable
+	 * app-skeleton drift. Real textual changes remain significant.
+	 */
+	private function normalizeTextForComparison(string $bytes): string {
+		$normalized = \str_replace(["\r\n", "\r"], "\n", $bytes);
+		return \str_ends_with($normalized, "\n") ? \substr($normalized, 0, -1) : $normalized;
+	}
 
 	/**
 	 * Write the current generated reference sidecar.

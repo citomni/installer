@@ -417,8 +417,9 @@ The command is deliberately repeatable:
   clean upstream drift can move forward while locally modified managed files receive
   `.new` instead of being overwritten.
 - Every create-only target is compared again against the current rendered source on
-  every run. Legitimate app-specific differences therefore keep appearing in the
-  report and receive a freshly generated `.new` reference each time.
+  every run. Legitimate app-specific differences therefore keep appearing as advisory
+  review items and receive a freshly generated `.new` reference each time without
+  blocking Composer posture or v2 state completion.
 - Existing `.new` files are generated artifacts and are overwritten on every real run.
   Do not use them as a workspace for manual merge edits.
 - Existing `.tpl` targets are authoritative package templates and are refreshed when
@@ -426,7 +427,8 @@ The command is deliberately repeatable:
 - `config/citomni_installer.php` is audited for missing and currently unused values.
 - Current package scaffold sources are scanned for `%UPPER_SNAKE_CASE%`-style tokens and reported as advisory source-hygiene warnings without changing migrate exit behavior.
 - `.gitignore`, `.gitattributes`, and `composer.json` are compared with one pinned
-  current `citomni/app-skeleton` commit and differing references are written as `.new`.
+  current `citomni/app-skeleton` commit using text semantics that ignore CRLF/LF and
+  one final-newline difference; real content differences are written as `.new`.
 - App-owned `.php` and `.php.tpl` files are recursively checked with `php -l`; vendor,
   caches, backups, uploads, Git metadata, node_modules, and root `_...` workspaces are
   excluded. Full lint output is stored in the migration report.
@@ -456,8 +458,9 @@ vendor/bin/citomni-installer migrate --environment=stage
 vendor/bin/citomni-installer migrate --environment=prod
 ```
 
-A `.new` scaffold sidecar, conflict, or PHP lint failure results in exit 4 so the
-required human review cannot be missed. App-skeleton root-file differences are advisory.
+A blocking managed-file `.new`, conflict, or PHP lint failure results in exit 4 so
+required corrective action cannot be missed. Create-only `.new` references and app-skeleton
+root-file differences are advisory.
 
 ### `repair`
 

@@ -18,6 +18,7 @@ use CitOmni\Installer\Enum\Environment;
 use CitOmni\Installer\Exception\InstallerException;
 use CitOmni\Installer\Operation\ApplyEnvironmentMaterialization;
 use CitOmni\Installer\Operation\ApplyScaffoldPlan;
+use CitOmni\Installer\Operation\AuditAppSkeletonMigration;
 use CitOmni\Installer\Operation\BuildScaffoldPlan;
 use CitOmni\Installer\Operation\BuildMigrationDiagnostics;
 use CitOmni\Installer\State\ScaffoldState;
@@ -552,15 +553,17 @@ $tests['migrate rebuilds legacy materialization from current manifests'] = stati
 	$legacyStateBytes = file_get_contents($statePath);
 
 	[$exit, $result, $output] = command($app, ['migrate', '--environment=dev']);
-	check($exit === 4, 'Migration with a create-only code difference must require manual review. ' . $output);
+	check($exit === 0, 'Create-only app differences must be advisory during migrate. ' . $output);
 	check(file_get_contents($app . '/public/environment.txt') === "dev\n", 'Migration did not refresh the environment-aware target.');
 	check(file_get_contents($app . '/bin/tool') === "tool version 1\n", 'Migration did not refresh an ordinary managed target.');
 	check(file_get_contents($app . '/config/app.php') === $customConfig, 'Migration overwrote an existing create-only target.');
 	check(is_file($app . '/config/app.php.new'), 'Migration did not write the create-only review sidecar.');
 	check(file_get_contents($app . '/config/app.php.new') === "<?php return ['name' => 'fixture'];\n", 'Migration sidecar does not contain the current rendered scaffold.');
-	check(($result['state_written'] ?? true) === false, 'Migration committed v2 state before manual review was resolved.');
-	check(($result['composer']['applied'] ?? true) === false, 'Migration changed Composer posture before manual review was resolved.');
-	check(!ScaffoldState::forAppRoot($app)->exists(), 'Migration wrote current state while manual review remained.');
+	check(($result['state_written'] ?? false) === true, 'Advisory create-only review prevented v2 state commit.');
+	check(($result['composer']['applied'] ?? false) === true, 'Advisory create-only review prevented Composer posture.');
+	check(($result['migration']['blocking_manual_review'] ?? ['unexpected']) === [], 'Create-only review was incorrectly classified as blocking.');
+	$advisory = $result['migration']['advisory_manual_review'] ?? [];
+	check(count($advisory) === 1 && ($advisory[0]['target'] ?? null) === 'config/app.php', 'Create-only review was not classified as advisory.');
 
 	$backupDir = (string)$result['backup_dir'];
 	$stateBackup = $backupDir . '/' . ScaffoldState::RELATIVE_PATH;
@@ -569,18 +572,10 @@ $tests['migrate rebuilds legacy materialization from current manifests'] = stati
 	check(is_file($backupDir . '/public/environment.txt'), 'Migration did not back up the replaced environment target.');
 	check(is_file($backupDir . '/bin/tool'), 'Migration did not back up the replaced managed target.');
 
-	// Simulate HITL resolution by accepting the generated current scaffold, then retry.
-	put($app . '/config/app.php', file_get_contents($app . '/config/app.php.new'));
-	unlink($app . '/config/app.php.new');
-	[$exit, $result, $output] = command($app, ['migrate', '--environment=dev']);
-	check($exit === 0, 'Migration did not complete after manual review was resolved. ' . $output);
-	check(($result['state_written'] ?? false) === true, 'Resolved migration did not commit v2 state.');
-	check(($result['composer']['applied'] ?? false) === true, 'Resolved migration did not apply Composer posture.');
-
 	$state = ScaffoldState::forAppRoot($app);
-	check($state->environment() === Environment::DEV, 'Resolved migration did not commit v2 dev state.');
+	check($state->environment() === Environment::DEV, 'Migration did not commit v2 dev state.');
 	$validated = $state->read();
-	check(($validated['format_version'] ?? null) === ScaffoldState::FORMAT_VERSION, 'Resolved migration did not write the current state format.');
+	check(($validated['format_version'] ?? null) === ScaffoldState::FORMAT_VERSION, 'Migration did not write the current state format.');
 	check(!isset($validated['packages']['obsolete/package']), 'Migration copied obsolete legacy package state into v2.');
 };
 
@@ -628,15 +623,16 @@ $tests['blocked v2 migrate can adopt managed bytes already advanced by the previ
 	$app = fixture($base, 'migrate-forward-recovery');
 	installed($app);
 	put($app . '/vendor/test/core/install/tool.stub', "tool version 2\n");
-	put($app . '/config/app.php', "<?php return ['name' => 'fixture', 'local' => true];\n");
+	put($app . '/public/environment.txt', "local managed edit\n");
 
 	[$exit, $result, $output] = command($app, ['migrate']);
-	check($exit === 4, 'Expected create-only review to block state commit. ' . $output);
+	check($exit === 4, 'Expected locally modified managed target to block state commit. ' . $output);
 	check(file_get_contents($app . '/bin/tool') === "tool version 2\n", 'First blocked migrate did not advance the clean managed target.');
+	check(file_get_contents($app . '/public/environment.txt') === "local managed edit\n", 'Blocked migrate overwrote the locally modified managed target.');
 	check(!($result['state_written'] ?? true), 'Blocked migrate unexpectedly committed v2 state.');
 
 	[$exit, $result, $output] = command($app, ['migrate']);
-	check($exit === 4, 'Second migrate should still report the create-only local difference. ' . $output);
+	check($exit === 4, 'Second migrate should still report the unresolved managed local difference. ' . $output);
 	$tool = resultFile($result, 'bin/tool');
 	check(($tool['applied'] ?? null) === 'registered', 'Second migrate misclassified already-current managed bytes as a local edit.');
 	check(($tool['reason'] ?? null) === 'adopt_current_migration_baseline', 'Second migrate did not use forward-recovery baseline adoption.');
@@ -673,6 +669,34 @@ $tests['migrate PHP lint failures are reported and return manual-action exit'] =
 	check(is_file($reportPath), 'Migration with lint failure did not write its report.');
 	$report = file_get_contents($reportPath);
 	check(str_contains($report, '## PHP lint') && str_contains($report, 'src/Bad.php'), 'Migration report omitted PHP lint output.');
+};
+
+$tests['app-skeleton audit ignores line endings and one final newline but reports content drift'] = static function () use ($base): void {
+	$app = $base . '/apps/app-skeleton-text-compare';
+	mkdir($app, 0775, true);
+	put($app . '/.gitignore', "vendor\r\nvar/cache");
+
+	$audit = new AuditAppSkeletonMigration(new PathGuard($app));
+	$reference = [
+		'sha' => str_repeat('a', 40),
+		'files' => [
+			'.gitignore' => [
+				'url' => 'https://example.invalid/.gitignore',
+				'bytes' => "vendor\nvar/cache\n",
+			],
+		],
+	];
+
+	$result = $audit->apply($reference, false);
+	check(($result['files'][0]['status'] ?? null) === 'identical', 'Line-ending/final-newline-only app-skeleton difference was not ignored.');
+	check(($result['manual_review'] ?? ['unexpected']) === [], 'Line-ending/final-newline-only app-skeleton difference became advisory.');
+	check(!is_file($app . '/.gitignore.new'), 'Line-ending/final-newline-only app-skeleton difference wrote a sidecar.');
+
+	put($app . '/.gitignore', "vendor\r\nvar/logs\r\n");
+	$result = $audit->apply($reference, false);
+	check(($result['files'][0]['status'] ?? null) === 'different', 'Real app-skeleton content drift was ignored.');
+	check(count($result['manual_review'] ?? []) === 1, 'Real app-skeleton content drift was not advisory.');
+	check(file_get_contents($app . '/.gitignore.new') === "vendor\nvar/cache\n", 'App-skeleton content drift sidecar does not contain current reference bytes.');
 };
 
 $tests['migrate lists percent-style source files when missing placeholders stop early'] = static function () use ($base): void {

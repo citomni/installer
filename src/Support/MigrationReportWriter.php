@@ -47,6 +47,7 @@ final class MigrationReportWriter {
 	private function render(array $result): string {
 		$migration = \is_array($result['migration'] ?? null) ? $result['migration'] : [];
 		$blocking = (array)($migration['blocking_manual_review'] ?? []);
+		$advisoryScaffold = (array)($migration['advisory_manual_review'] ?? []);
 		$appSkeleton = \is_array($migration['app_skeleton'] ?? null) ? $migration['app_skeleton'] : [];
 		$advisory = (array)($appSkeleton['manual_review'] ?? []);
 		$config = \is_array($migration['installer_config'] ?? null) ? $migration['installer_config'] : [];
@@ -71,6 +72,7 @@ final class MigrationReportWriter {
 			$out .= '- ' . $label . ': ' . $count . "\n";
 		}
 		$out .= '- Blocking manual-review files: ' . \count($blocking) . "\n";
+		$out .= '- Advisory create-only scaffold review files: ' . \count($advisoryScaffold) . "\n";
 		$out .= '- Advisory app-skeleton review files: ' . \count($advisory) . "\n";
 		if ($phpLint !== []) {
 			$out .= '- PHP lint checked: ' . (int)($phpLint['checked'] ?? 0) . "\n";
@@ -79,7 +81,7 @@ final class MigrationReportWriter {
 		$out .= '- Current scaffold sources with percent-style token warnings: ' . (int)($sourceWarnings['file_count'] ?? 0) . "\n";
 		$out .= "\n";
 
-		$out .= "## Manual review required\n\n";
+		$out .= "## Migration review\n\n";
 		$out .= "### Blocking scaffold files\n\n";
 		if ($blocking === []) {
 			$out .= "None.\n\n";
@@ -88,6 +90,20 @@ final class MigrationReportWriter {
 				$out .= '- `' . (string)($item['package'] ?? '') . ': ' . (string)($item['target'] ?? '') . '` — ' . (string)($item['reason'] ?? 'manual review') . "\n";
 			}
 			$out .= "\nThese files block completion of the scaffold migration until the local and `.new` versions have been reconciled.\n\n";
+		}
+
+		$out .= "### Advisory create-only scaffold files\n\n";
+		if ($advisoryScaffold === []) {
+			$out .= "None.\n\n";
+		} else {
+			foreach ($advisoryScaffold as $item) {
+				$out .= '- `' . (string)($item['package'] ?? '') . ': ' . (string)($item['target'] ?? '') . '` — ' . (string)($item['reason'] ?? 'manual review');
+				if (isset($item['new_path'])) {
+					$out .= ' — review `' . (string)$item['new_path'] . '`';
+				}
+				$out .= "\n";
+			}
+			$out .= "\nThese create-only files are app-owned after creation. Local differences are expected, remain untouched, and do not prevent Composer posture or v2 scaffold state from being committed. The `.new` files are refreshed current-source references and will continue to be reported on later migrate runs while differences remain.\n\n";
 		}
 
 		$out .= "### PHP lint failures\n\n";

@@ -201,6 +201,7 @@ final class MigrateCommand extends AbstractWriteCommand {
 				'scaffold_source_warnings' => $sourceWarnings,
 				'scaffold_diffs' => $planDiagnostics['scaffold_diffs'],
 				'blocking_manual_review' => $this->diagnostics->blockingManualReview($result),
+				'advisory_manual_review' => $this->diagnostics->advisoryManualReview($result),
 				'app_skeleton' => $appSkeleton,
 				'php_lint' => $phpLint,
 			];

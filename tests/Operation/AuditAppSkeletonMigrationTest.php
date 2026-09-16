@@ -50,6 +50,20 @@ final class AuditAppSkeletonMigrationTest extends TestCase {
 		$this->assertCount(1, $result['manual_review']);
 	}
 
+
+	public function testLineEndingsAndOneFinalNewlineDoNotCreateAdvisoryDifference(): void {
+		\file_put_contents($this->appRoot . '/.gitignore', "vendor\r\nvar/cache");
+		$audit = new AuditAppSkeletonMigration(new PathGuard($this->appRoot));
+
+		$result = $audit->apply($this->reference("vendor\nvar/cache\n"), false);
+
+		$this->assertSame('identical', $result['files'][0]['status']);
+		$this->assertSame('none', $result['files'][0]['action']);
+		$this->assertSame('', $result['files'][0]['diff']);
+		$this->assertSame([], $result['manual_review']);
+		$this->assertFileDoesNotExist($this->appRoot . '/.gitignore.new');
+	}
+
 	public function testExistingReferenceSidecarIsOverwrittenWithCurrentReference(): void {
 		\file_put_contents($this->appRoot . '/.gitignore', "local\n");
 		\file_put_contents($this->appRoot . '/.gitignore.new', "stale snapshot\n");

@@ -189,7 +189,10 @@ final class ApplyScaffoldPlan {
 				$resultFiles[] = $entry;
 
 				$applied = (string)($entry['applied'] ?? '');
-				if ($applied === 'failed' || $applied === 'conflict' || $applied === 'wrote_new') {
+				$advisoryCreateOnly = $migration
+					&& $applied === 'wrote_new'
+					&& (string)($entry['policy'] ?? '') === 'create-only';
+				if ($applied === 'failed' || $applied === 'conflict' || ($applied === 'wrote_new' && !$advisoryCreateOnly)) {
 					$ok = false;
 				}
 				if (isset($entry['backup_path'])) {

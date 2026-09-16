@@ -353,6 +353,9 @@ final class BuildMigrationDiagnostics {
 				if (!\in_array($applied, ['wrote_new', 'conflict', 'failed'], true)) {
 					continue;
 				}
+				if ($applied === 'wrote_new' && (string)($file['policy'] ?? '') === 'create-only') {
+					continue;
+				}
 
 				$item = [
 					'package' => $packageName,
@@ -361,6 +364,45 @@ final class BuildMigrationDiagnostics {
 					'reason' => (string)($file['reason'] ?? 'manual_review'),
 				];
 				foreach (['new_path', 'new_status', 'error_type', 'error'] as $key) {
+					if (isset($file[$key])) {
+						$item[$key] = (string)$file[$key];
+					}
+				}
+				$manual[] = $item;
+			}
+		}
+
+		return $manual;
+	}
+
+
+	/**
+	 * Build the advisory review list for app-owned create-only migration differences.
+	 *
+	 * Create-only targets intentionally become app-owned after creation. A fresh `.new`
+	 * reference remains useful on every migrate run, but a legitimate local difference
+	 * must not prevent Composer posture or installer state from completing.
+	 *
+	 * @param array<string,mixed> $result Apply/materialization result.
+	 * @return list<array<string,mixed>> Create-only files worth reviewing without blocking migration.
+	 */
+	public function advisoryManualReview(array $result): array {
+		$manual = [];
+
+		foreach ((array)($result['packages'] ?? []) as $package) {
+			$packageName = (string)($package['name'] ?? '');
+			foreach ((array)($package['files'] ?? []) as $file) {
+				if ((string)($file['applied'] ?? '') !== 'wrote_new' || (string)($file['policy'] ?? '') !== 'create-only') {
+					continue;
+				}
+
+				$item = [
+					'package' => $packageName,
+					'target' => (string)($file['target'] ?? ''),
+					'applied' => 'wrote_new',
+					'reason' => (string)($file['reason'] ?? 'manual_review'),
+				];
+				foreach (['new_path', 'new_status'] as $key) {
 					if (isset($file[$key])) {
 						$item[$key] = (string)$file[$key];
 					}

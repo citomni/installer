@@ -414,16 +414,18 @@ The environment defaults to dev when omitted. Legacy v1/no-state applications re
 from current manifests. Current v2 applications may be migrated again and use their
 recorded managed baselines to protect local edits while every target is re-evaluated
 against current package sources. Create-only PHP code differences are preserved and
-receive a freshly generated `<target>.new` on every real run; existing generated
-sidecars are overwritten deliberately. Existing `*.tpl` targets are authoritative
+receive a freshly generated `<target>.new` on every real run as advisory review items;
+they do not block Composer posture or v2 state completion. Existing generated sidecars
+are overwritten deliberately. Existing `*.tpl` targets are authoritative
 current templates. The command also audits installer placeholders, reports advisory
 percent-style uppercase tokens found in current package scaffold sources, compares root
-references with one pinned current citomni/app-skeleton commit, recursively runs
+references with one pinned current citomni/app-skeleton commit while ignoring line-ending
+and one final-newline difference, recursively runs
 `php -l` on app-owned `.php` and `.php.tpl` files, and writes a Markdown report under
 var/logs/citomni-installer/migrations/ after real runs.
 
 Exit codes:
-  0  applied / nothing to do   4  manual review / lint failure / conflict
+  0  applied / advisory review   4  blocking managed review / lint failure / conflict
   5  unsafe state              6  IO/permission error
   1  error                     2  invalid usage
 
