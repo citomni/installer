@@ -25,14 +25,19 @@ use CitOmni\Installer\Cli\Command\SyncCommand;
 use CitOmni\Installer\Enum\ExitCode;
 use CitOmni\Installer\Operation\ApplyScaffoldPlan;
 use CitOmni\Installer\Operation\ApplyEnvironmentMaterialization;
+use CitOmni\Installer\Operation\AuditAppSkeletonMigration;
+use CitOmni\Installer\Operation\BuildMigrationDiagnostics;
 use CitOmni\Installer\Operation\BuildScaffoldPlan;
 use CitOmni\Installer\State\ScaffoldState;
+use CitOmni\Installer\Support\AppSkeletonReferenceFetcher;
 use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\ScaffoldManifestLocator;
 use CitOmni\Installer\Support\ScaffoldRenderer;
 use CitOmni\Installer\Support\ComposerRunner;
 use CitOmni\Installer\Support\InstallerLock;
+use CitOmni\Installer\Support\MigrationReportWriter;
+use CitOmni\Installer\Support\PhpLintRunner;
 use CitOmni\Installer\Exception\InstallerException;
 
 /**
@@ -49,8 +54,8 @@ use CitOmni\Installer\Exception\InstallerException;
  * Notes:
  * - This class is intentionally not framework-aware: it does not boot CitOmni and
  *   has no service map. Collaborators are created with `new`/factory helpers.
- * - The command classes never write app files themselves; only ApplyScaffoldPlan
- *   (injected into the write commands) may mutate files or state.
+ * - Command classes never write app files themselves. Injected Operations and focused
+ *   Support writers own scaffold, migration-sidecar, report, and state mutations.
  */
 final class InstallerCli {
 
@@ -143,7 +148,20 @@ final class InstallerCli {
 
 					$command = match ($name) {
 						'install' => new InstallCommand($locator, $builder, $applier, $resolver, $state, $lock, $materializer),
-						'migrate' => new MigrateCommand($locator, $builder, $applier, $resolver, $state, $lock, $materializer),
+						'migrate' => new MigrateCommand(
+							$locator,
+							$builder,
+							$applier,
+							$resolver,
+							$state,
+							$lock,
+							$materializer,
+							new BuildMigrationDiagnostics($renderer, $resolver),
+							new AppSkeletonReferenceFetcher(),
+							new AuditAppSkeletonMigration($pathGuard),
+							new MigrationReportWriter($pathGuard),
+							new PhpLintRunner($pathGuard)
+						),
 						'environment' => new EnvironmentCommand($locator, $builder, $applier, $resolver, $state, $lock, $materializer),
 						'repair' => new RepairCommand($locator, $builder, $applier, $resolver, $state, $lock),
 						default => new SyncCommand($locator, $builder, $applier, $resolver, $state, $lock),
@@ -306,7 +324,7 @@ Commands:
   doctor    Validate environment, manifests, installer config and write access.
   status    Report scaffold state per package.
   install   Perform initial materialization for an explicit environment.
-  migrate   Rebuild legacy materialization from current manifests.
+  migrate   Reconcile scaffold and migration references against current sources.
   environment  Switch environment-aware files and Composer posture.
   repair    Recreate missing files from recorded state.
   sync      Sync package-owned scaffold to the current baseline.
@@ -386,21 +404,26 @@ Exit codes:
 
 TXT,
 			'migrate' => <<<TXT
-citomni-installer migrate — rebuild legacy materialization from current manifests
+citomni-installer migrate — repeatable scaffold migration and reconciliation
 
 Usage:
-  citomni-installer migrate --environment=<dev|stage|prod> [--format=text|json]
+  citomni-installer migrate [--environment=<dev|stage|prod>] [--format=text|json]
                             [--placeholder=KEY=VALUE ...] [--dry-run]
 
-Uses the currently installed package manifests as the complete authority. Existing
-create-only targets are preserved. Managed targets are adopted when they already
-match the current rendering; differing managed targets are backed up and replaced.
-A known v1 state file is backed up and removed before the new v2 state is committed.
-A missing state is accepted so an interrupted migration can be resumed.
+The environment defaults to dev when omitted. Legacy v1/no-state applications rebuild
+from current manifests. Current v2 applications may be migrated again and use their
+recorded managed baselines to protect local edits while every target is re-evaluated
+against current package sources. Create-only PHP code differences are preserved and
+receive a freshly generated `<target>.new` on every real run; existing generated
+sidecars are overwritten deliberately. Existing `*.tpl` targets are authoritative
+current templates. The command also audits installer placeholders, compares root
+references with one pinned current citomni/app-skeleton commit, recursively runs
+`php -l` on app-owned `.php` and `.php.tpl` files, and writes a Markdown report under
+var/logs/citomni-installer/migrations/ after real runs.
 
 Exit codes:
-  0  applied / nothing to do   4  already current / conflict
-  5  unsafe legacy state       6  IO/permission error
+  0  applied / nothing to do   4  manual review / lint failure / conflict
+  5  unsafe state              6  IO/permission error
   1  error                     2  invalid usage
 
 TXT,

@@ -549,22 +549,36 @@ $tests['migrate rebuilds legacy materialization from current manifests'] = stati
 	$legacyStateBytes = file_get_contents($statePath);
 
 	[$exit, $result, $output] = command($app, ['migrate', '--environment=dev']);
-	check($exit === 0, 'Legacy migration failed. ' . $output);
+	check($exit === 4, 'Migration with a create-only code difference must require manual review. ' . $output);
 	check(file_get_contents($app . '/public/environment.txt') === "dev\n", 'Migration did not refresh the environment-aware target.');
 	check(file_get_contents($app . '/bin/tool') === "tool version 1\n", 'Migration did not refresh an ordinary managed target.');
 	check(file_get_contents($app . '/config/app.php') === $customConfig, 'Migration overwrote an existing create-only target.');
+	check(is_file($app . '/config/app.php.new'), 'Migration did not write the create-only review sidecar.');
+	check(file_get_contents($app . '/config/app.php.new') === "<?php return ['name' => 'fixture'];\n", 'Migration sidecar does not contain the current rendered scaffold.');
+	check(($result['state_written'] ?? true) === false, 'Migration committed v2 state before manual review was resolved.');
+	check(($result['composer']['applied'] ?? true) === false, 'Migration changed Composer posture before manual review was resolved.');
+	check(!ScaffoldState::forAppRoot($app)->exists(), 'Migration wrote current state while manual review remained.');
 
-	$state = ScaffoldState::forAppRoot($app);
-	check($state->environment() === Environment::DEV, 'Migration did not commit v2 dev state.');
-	$validated = $state->read();
-	check(($validated['format_version'] ?? null) === ScaffoldState::FORMAT_VERSION, 'Migration did not write the current state format.');
-	check(!isset($validated['packages']['obsolete/package']), 'Migration copied obsolete legacy package state into v2.');
-
-	$stateBackup = (string)$result['backup_dir'] . '/' . ScaffoldState::RELATIVE_PATH;
+	$backupDir = (string)$result['backup_dir'];
+	$stateBackup = $backupDir . '/' . ScaffoldState::RELATIVE_PATH;
 	check(is_file($stateBackup), 'Migration did not back up legacy state.');
 	check(file_get_contents($stateBackup) === $legacyStateBytes, 'Legacy state backup bytes differ from the original.');
-	check(is_file((string)$result['backup_dir'] . '/public/environment.txt'), 'Migration did not back up the replaced environment target.');
-	check(is_file((string)$result['backup_dir'] . '/bin/tool'), 'Migration did not back up the replaced managed target.');
+	check(is_file($backupDir . '/public/environment.txt'), 'Migration did not back up the replaced environment target.');
+	check(is_file($backupDir . '/bin/tool'), 'Migration did not back up the replaced managed target.');
+
+	// Simulate HITL resolution by accepting the generated current scaffold, then retry.
+	put($app . '/config/app.php', file_get_contents($app . '/config/app.php.new'));
+	unlink($app . '/config/app.php.new');
+	[$exit, $result, $output] = command($app, ['migrate', '--environment=dev']);
+	check($exit === 0, 'Migration did not complete after manual review was resolved. ' . $output);
+	check(($result['state_written'] ?? false) === true, 'Resolved migration did not commit v2 state.');
+	check(($result['composer']['applied'] ?? false) === true, 'Resolved migration did not apply Composer posture.');
+
+	$state = ScaffoldState::forAppRoot($app);
+	check($state->environment() === Environment::DEV, 'Resolved migration did not commit v2 dev state.');
+	$validated = $state->read();
+	check(($validated['format_version'] ?? null) === ScaffoldState::FORMAT_VERSION, 'Resolved migration did not write the current state format.');
+	check(!isset($validated['packages']['obsolete/package']), 'Migration copied obsolete legacy package state into v2.');
 };
 
 $tests['migrate dry-run is read-only and interrupted migration can resume without state'] = static function () use ($base): void {
@@ -589,13 +603,73 @@ $tests['migrate dry-run is read-only and interrupted migration can resume withou
 	check(ScaffoldState::forAppRoot($app)->environment() === Environment::DEV, 'Resumed migration did not commit current state.');
 };
 
-$tests['migrate rejects an already current application'] = static function () use ($base): void {
+$tests['migrate reconciles an already current v2 application and defaults to dev'] = static function () use ($base): void {
 	$app = fixture($base, 'migrate-current');
 	installed($app);
-	$before = file_get_contents(ScaffoldState::forAppRoot($app)->path());
-	[$exit] = command($app, ['migrate', '--environment=dev']);
-	check($exit === 4, 'Migration accepted an already-current v2 application.');
-	check(file_get_contents(ScaffoldState::forAppRoot($app)->path()) === $before, 'Rejected migration changed current state.');
+
+	[$exit, $result, $output] = command($app, ['migrate']);
+	check($exit === 0, 'Current v2 migration reconciliation failed. ' . $output);
+	check(($result['environment'] ?? null) === 'dev', 'Migrate without --environment did not default to dev.');
+	check(($result['migration']['mode'] ?? null) === 'reconcile_v2', 'Current v2 migrate did not enter reconciliation mode.');
+	check(ScaffoldState::forAppRoot($app)->environment() === Environment::DEV, 'Current v2 reconciliation lost the recorded environment.');
+
+	put($app . '/bin/tool', "local managed edit\n");
+	put($app . '/bin/tool.new', "stale generated sidecar\n");
+	[$exit, $result, $output] = command($app, ['migrate']);
+	check($exit === 4, 'Locally modified managed v2 target did not require manual review. ' . $output);
+	check(file_get_contents($app . '/bin/tool') === "local managed edit\n", 'V2 migrate overwrote a locally modified managed target.');
+	check(file_get_contents($app . '/bin/tool.new') === "tool version 1\n", 'V2 migrate did not overwrite the stale managed .new sidecar with current desired bytes.');
+};
+
+$tests['blocked v2 migrate can adopt managed bytes already advanced by the previous attempt'] = static function () use ($base): void {
+	$app = fixture($base, 'migrate-forward-recovery');
+	installed($app);
+	put($app . '/vendor/test/core/install/tool.stub', "tool version 2\n");
+	put($app . '/config/app.php', "<?php return ['name' => 'fixture', 'local' => true];\n");
+
+	[$exit, $result, $output] = command($app, ['migrate']);
+	check($exit === 4, 'Expected create-only review to block state commit. ' . $output);
+	check(file_get_contents($app . '/bin/tool') === "tool version 2\n", 'First blocked migrate did not advance the clean managed target.');
+	check(!($result['state_written'] ?? true), 'Blocked migrate unexpectedly committed v2 state.');
+
+	[$exit, $result, $output] = command($app, ['migrate']);
+	check($exit === 4, 'Second migrate should still report the create-only local difference. ' . $output);
+	$tool = resultFile($result, 'bin/tool');
+	check(($tool['applied'] ?? null) === 'registered', 'Second migrate misclassified already-current managed bytes as a local edit.');
+	check(($tool['reason'] ?? null) === 'adopt_current_migration_baseline', 'Second migrate did not use forward-recovery baseline adoption.');
+};
+
+$tests['migrate default dev safely switches a current v2 prod environment'] = static function () use ($base): void {
+	$app = fixture($base, 'migrate-default-dev');
+	installed($app);
+	[$exit, , $output] = command($app, ['environment', 'prod']);
+	check($exit === 0, 'Fixture could not switch to prod before default-dev migrate. ' . $output);
+	check(ScaffoldState::forAppRoot($app)->environment() === Environment::PROD, 'Fixture did not enter prod.');
+
+	[$exit, $result, $output] = command($app, ['migrate']);
+	check($exit === 0, 'Migrate without environment did not safely switch current v2 prod to dev. ' . $output);
+	check(($result['environment'] ?? null) === 'dev', 'Default migrate environment was not dev.');
+	check(ScaffoldState::forAppRoot($app)->environment() === Environment::DEV, 'Default migrate did not persist dev environment.');
+	check(file_get_contents($app . '/public/environment.txt') === "dev\n", 'Default migrate did not materialize dev environment bytes.');
+	$environmentFile = resultFile($result, 'public/environment.txt');
+	check(isset($environmentFile['backup_path']), 'Default prod-to-dev reconciliation did not back up the environment-aware target.');
+};
+
+$tests['migrate PHP lint failures are reported and return manual-action exit'] = static function () use ($base): void {
+	$app = fixture($base, 'migrate-lint');
+	installed($app);
+	put($app . '/src/Bad.php', "<?php\nreturn [;\n");
+
+	[$exit, $result, $output] = command($app, ['migrate']);
+	check($exit === 4, 'PHP lint failure did not produce manual-action exit. ' . $output);
+	$lint = $result['migration']['php_lint'] ?? null;
+	check(is_array($lint) && ($lint['failed'] ?? 0) === 1, 'Migration did not report the PHP lint failure.');
+	$paths = array_column($lint['files'] ?? [], 'path');
+	check(in_array('src/Bad.php', $paths, true), 'Migration PHP lint omitted the invalid app source.');
+	$reportPath = (string)($result['migration_report'] ?? '');
+	check(is_file($reportPath), 'Migration with lint failure did not write its report.');
+	$report = file_get_contents($reportPath);
+	check(str_contains($report, '## PHP lint') && str_contains($report, 'src/Bad.php'), 'Migration report omitted PHP lint output.');
 };
 
 $tests['state format and environment-switch boundaries remain strict'] = static function () use ($base): void {

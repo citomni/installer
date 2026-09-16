@@ -21,19 +21,26 @@ use CitOmni\Installer\Enum\ExitCode;
 use CitOmni\Installer\Exception\InstallerException;
 use CitOmni\Installer\Operation\ApplyEnvironmentMaterialization;
 use CitOmni\Installer\Operation\ApplyScaffoldPlan;
+use CitOmni\Installer\Operation\AuditAppSkeletonMigration;
+use CitOmni\Installer\Operation\BuildMigrationDiagnostics;
 use CitOmni\Installer\Operation\BuildScaffoldPlan;
 use CitOmni\Installer\State\ScaffoldState;
+use CitOmni\Installer\Support\AppSkeletonReferenceFetcher;
 use CitOmni\Installer\Support\InstallerLock;
+use CitOmni\Installer\Support\MigrationReportWriter;
 use CitOmni\Installer\Support\PlaceholderResolver;
+use CitOmni\Installer\Support\PhpLintRunner;
 use CitOmni\Installer\Support\ScaffoldManifestLocator;
 
 /**
- * `migrate` — rebuild legacy installer materialization from current manifests.
+ * `migrate` — repeatable scaffold migration and reconciliation against current sources.
  *
- * Legacy state is never converted into the new baseline. Current installed package
- * manifests and current placeholder resolution are authoritative. Existing create-only
- * files are preserved, while managed files are adopted when current or backed up and
- * replaced when they differ. Composer posture and v2 state are committed last.
+ * Legacy/no-state applications rebuild from current manifests. Current v2 applications
+ * keep their trusted managed baselines so local edits remain protected, while every
+ * target is still re-evaluated against today's installed package sources. Create-only
+ * code differences become freshly generated `.new` sidecars on every run. Template
+ * targets remain authoritative. App-skeleton references and recursive PHP lint are
+ * included in the human-review report.
  */
 final class MigrateCommand extends AbstractWriteCommand {
 
@@ -44,7 +51,12 @@ final class MigrateCommand extends AbstractWriteCommand {
 		PlaceholderResolver $placeholders,
 		ScaffoldState $state,
 		InstallerLock $lock,
-		private readonly ApplyEnvironmentMaterialization $materializer
+		private readonly ApplyEnvironmentMaterialization $materializer,
+		private readonly BuildMigrationDiagnostics $diagnostics,
+		private readonly AppSkeletonReferenceFetcher $appSkeletonFetcher,
+		private readonly AuditAppSkeletonMigration $appSkeletonAudit,
+		private readonly MigrationReportWriter $reportWriter,
+		private readonly PhpLintRunner $phpLint
 	) {
 		parent::__construct($locator, $builder, $applier, $placeholders, $state, $lock);
 	}
@@ -71,7 +83,7 @@ final class MigrateCommand extends AbstractWriteCommand {
 		$opt = $parsed['options'];
 		$format = $opt['format'];
 
-		$environment = $this->parseEnvironmentOption($opt['environment'], $format);
+		$environment = $this->parseEnvironmentOption($opt['environment'] ?? null, $format);
 		if (!$environment instanceof Environment) {
 			return ExitCode::USAGE_ERROR->value;
 		}
@@ -93,21 +105,92 @@ final class MigrateCommand extends AbstractWriteCommand {
 		$format = $opt['format'];
 
 		try {
-			// Validate migration eligibility before manifest planning. The returned legacy
-			// data is intentionally ignored; current manifests are authoritative.
-			$this->state->legacyVersionForMigration();
+			$migrationVersion = $this->state->migrationVersion();
+			$reconcileCurrent = $migrationVersion === ScaffoldState::FORMAT_VERSION;
+			$currentEnvironment = $reconcileCurrent ? $this->state->environment() : null;
+			$environmentChanged = $currentEnvironment instanceof Environment && $currentEnvironment !== $environment;
 
-			$manifests = $this->locator->discover();
-			if ($manifests === []) {
+			$discovered = $this->locator->discover();
+			if ($discovered === []) {
 				return $this->emptyResult($format, null);
 			}
 
-			$manifests = $this->locator->selectEnvironment($manifests, $environment);
+			$configAudit = $this->diagnostics->inspectInstallerConfig($discovered, $environment, $opt['placeholders']);
+			$missing = (array)($configAudit['missing_effective_selected'] ?? []);
+			if ($missing !== []) {
+				return $this->fail(
+					$format,
+					\sprintf(
+						'Missing installer placeholders for %s: %s. Add them to config/citomni_installer.php or pass --placeholder=KEY=VALUE.',
+						$environment->value,
+						\implode(', ', $missing)
+					),
+					ExitCode::GENERAL_ERROR->value
+				);
+			}
+
+			$manifests = $this->locator->selectEnvironment($discovered, $environment);
 			$placeholders = $this->resolvePlaceholders($manifests, $opt['placeholders']);
 			$plan = $this->builder->build('migrate', $manifests, $placeholders, [
 				'environment_materialization' => true,
+				'migration_reconcile' => $reconcileCurrent,
+				'migration_environment_changed' => $environmentChanged,
 			]);
+			$planDiagnostics = $this->diagnostics->inspectPlan($plan);
+
 			$result = $this->materializer->apply($plan, $environment, ['dry_run' => $opt['dry_run']]);
+
+			try {
+				// Compare composer.json only after environment materialization so the diff
+				// reflects the final classmap-authoritative posture of this run.
+				$reference = $this->appSkeletonFetcher->fetchCurrent();
+				$appSkeleton = $this->appSkeletonAudit->apply($reference, (bool)$opt['dry_run']);
+			} catch (InstallerException $e) {
+				// App-skeleton comparison is advisory. Network/filesystem trouble here must
+				// not invalidate scaffold and Composer materialization that already succeeded.
+				$appSkeleton = [
+					'available' => false,
+					'source' => 'citomni/app-skeleton',
+					'error' => $e->getMessage(),
+					'files' => [],
+					'manual_review' => [],
+				];
+			}
+
+			try {
+				$phpLint = $this->phpLint->run();
+			} catch (InstallerException $e) {
+				$phpLint = [
+					'available' => false,
+					'php_binary' => \PHP_BINARY,
+					'checked' => 0,
+					'passed' => 0,
+					'failed' => 0,
+					'files' => [],
+					'error' => $e->getMessage(),
+				];
+			}
+
+			$result['migration'] = [
+				'mode' => $reconcileCurrent ? 'reconcile_v2' : 'rebuild_legacy',
+				'previous_environment' => $currentEnvironment?->value,
+				'installer_config' => $configAudit,
+				'scaffold_diffs' => $planDiagnostics['scaffold_diffs'],
+				'blocking_manual_review' => $this->diagnostics->blockingManualReview($result),
+				'app_skeleton' => $appSkeleton,
+				'php_lint' => $phpLint,
+			];
+			$result['migration_report'] = null;
+			$result['migration_report_error'] = null;
+			if (!$opt['dry_run']) {
+				try {
+					$result['migration_report'] = $this->reportWriter->write($result);
+				} catch (InstallerException $e) {
+					// Reporting is post-commit audit output. Never turn an already completed
+					// migration into a false failure merely because var/logs is unavailable.
+					$result['migration_report_error'] = $e->getMessage();
+				}
+			}
 		} catch (InstallerException $e) {
 			return $this->fail($format, $e->getMessage(), $this->exceptionExitCode($e));
 		}
@@ -131,12 +214,11 @@ final class MigrateCommand extends AbstractWriteCommand {
 	 * @return Environment|null Null after emitting a usage error.
 	 */
 	private function parseEnvironmentOption(mixed $value, string $format): ?Environment {
-		if (!\is_string($value) || $value === '') {
-			$this->fail(
-				$format,
-				'migrate requires --environment=<dev|stage|prod>.',
-				ExitCode::USAGE_ERROR->value
-			);
+		if ($value === null || $value === '') {
+			return Environment::DEV;
+		}
+		if (!\is_string($value)) {
+			$this->fail($format, 'Invalid migrate environment option.', ExitCode::USAGE_ERROR->value);
 			return null;
 		}
 

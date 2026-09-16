@@ -17,7 +17,6 @@ namespace CitOmni\Installer\State;
 
 use CitOmni\Installer\Enum\Environment;
 use CitOmni\Installer\Exception\InstallerException;
-use CitOmni\Installer\Exception\ConflictException;
 use CitOmni\Installer\Support\AtomicFileWriter;
 use CitOmni\Installer\Support\PathGuard;
 
@@ -80,18 +79,18 @@ final class ScaffoldState {
 
 
 	/**
-	 * Validate whether the canonical state is eligible for explicit migration.
+	 * Return the current installer state version for migration/reconciliation.
 	 *
-	 * Migration never consumes legacy package/file baselines. This method only proves
-	 * that an existing state file is a known CitOmni installer v1 state before the
-	 * migration flow backs it up and replaces it. A missing state is allowed so an
-	 * interrupted migration can be resumed safely.
+	 * Behavior:
+	 * - Missing state is valid and returns null.
+	 * - Known legacy v1 state is validated only enough to prove installer ownership.
+	 * - Current v2 state is fully validated and may be reconciled by migrate again.
+	 * - Unknown, foreign, or malformed state fails closed.
 	 *
-	 * @return int|null Legacy format version, or null when no state exists.
-	 * @throws ConflictException When the application already has current v2 state.
+	 * @return int|null State format version, or null when no state exists.
 	 * @throws InstallerException When the state is malformed, foreign, or unsupported.
 	 */
-	public function legacyVersionForMigration(): ?int {
+	public function migrationVersion(): ?int {
 		$path = $this->path();
 		\clearstatcache(true, $path);
 		if (!\file_exists($path)) {
@@ -120,11 +119,8 @@ final class ScaffoldState {
 
 		$version = $data['format_version'];
 		if ($version === self::FORMAT_VERSION) {
-			throw new ConflictException(\sprintf(
-				'State file is already format_version %d; migrate is not applicable: %s',
-				self::FORMAT_VERSION,
-				$path
-			));
+			$this->validate($data);
+			return $version;
 		}
 		if ($version !== 1) {
 			throw new InstallerException(\sprintf(

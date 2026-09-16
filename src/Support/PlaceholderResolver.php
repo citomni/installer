@@ -107,6 +107,31 @@ final class PlaceholderResolver {
 	}
 
 
+	/**
+	 * Return the validated placeholders configured directly by the application.
+	 *
+	 * Derived values are intentionally excluded so migration diagnostics can distinguish
+	 * real config inputs from values synthesized by the resolver.
+	 *
+	 * @return array<string,string> Sorted configured placeholder map.
+	 */
+	public function configuredPlaceholders(): array {
+		$configured = $this->loadConfigPlaceholders();
+		$this->assertNoDerivedHostInputs($configured, 'installer config');
+		\ksort($configured, \SORT_STRING);
+		return $configured;
+	}
+
+
+	/**
+	 * Expose derived placeholder dependencies for read-only diagnostics.
+	 *
+	 * @return array<string,string> Derived key => configured source key.
+	 */
+	public static function derivedPlaceholderSources(): array {
+		return self::DERIVED_ROOT_HOSTS;
+	}
+
 
 	/**
 	 * Reject direct inputs for derived ROOT_HOST placeholders.

@@ -41,8 +41,9 @@ use CitOmni\Installer\Exception\ConflictException;
  *        target atomically, stage a state entry.
  *     2) update with `backup_required` (forced overwrite) -> copy the existing target
  *        to var/backups/citomni-installer/<ts>/<target> atomically, THEN overwrite.
- *     3) write_new -> render and write `<target>.new` atomically; state is NOT updated
- *        (the recorded baseline must keep pointing at the prior rendered bytes).
+ *     3) write_new -> render `<target>.new`, write it only when missing, reuse an exact
+ *        generated sidecar, and refuse to overwrite a differing existing sidecar. State is
+ *        NOT updated (the recorded baseline must keep pointing at the prior rendered bytes).
  *     4) register_state -> no file write; re-resolve the target, re-render the source, and
  *        confirm the current disk bytes still match the freshly rendered baseline before
  *        staging a state entry (adopt-clean-baseline). The recorded checksums are the fresh
@@ -120,16 +121,18 @@ final class ApplyScaffoldPlan {
 		$migration = $command === 'migrate';
 
 		// -- 1. Precondition: existing state must be safe before we touch anything --------
-		// Normal lifecycle commands require current state. Migration accepts only a known
-		// v1 state (or no state after an interrupted attempt) and rebuilds baselines from
-		// current manifests, never from the legacy package map.
-		$legacyVersion = $migration ? $this->state->legacyVersionForMigration() : null;
-		$statePackages = $migration ? [] : $this->state->readPackages();
+		// Normal lifecycle commands require current state. Migration accepts missing state,
+		// known legacy v1 state, or current v2 state. Legacy/no-state migration rebuilds
+		// baselines; v2 reconciliation preserves its trusted managed baseline map.
+		$migrationVersion = $migration ? $this->state->migrationVersion() : null;
+		$legacyMigration = $migration && $migrationVersion === 1;
+		$currentMigration = $migration && $migrationVersion === ScaffoldState::FORMAT_VERSION;
+		$statePackages = $currentMigration || !$migration ? $this->state->readPackages() : [];
 
 		$ts  = $this->timestamp();
 		$now = $this->nowIso8601();
 		$backupReserved = false;
-		$needsBackupRoot = $legacyVersion !== null;
+		$needsBackupRoot = $legacyMigration;
 		if (!$needsBackupRoot) {
 			foreach ($plan['packages'] as $package) {
 				foreach ($package['files'] as $file) {
@@ -151,7 +154,7 @@ final class ApplyScaffoldPlan {
 		}
 
 		$stateBackupPath = null;
-		if ($legacyVersion !== null) {
+		if ($legacyMigration) {
 			$statePath = $this->state->path();
 			$stateBackupPath = $this->backupPathFor(ScaffoldState::RELATIVE_PATH, $ts);
 			if (!$dryRun) {
@@ -358,18 +361,30 @@ final class ApplyScaffoldPlan {
 		$placeholders    = (array)($apply['placeholders'] ?? []);
 		$plannedRendered = (string)($apply['rendered_checksum'] ?? '');
 
-		$targetAbs = $this->pathGuard->resolveTarget($normTarget);
-		$newPath   = $targetAbs . '.new';
+		$this->assertTargetFresh($apply);
+		$newPath = $this->pathGuard->resolveTarget($normTarget . '.new');
 
 		[, $renderedCk, $bytes] = $this->renderForApply($sourceAbs, $placeholders);
 		$this->assertPlanFresh($normTarget, $renderedCk, $plannedRendered);
 
+		if (\file_exists($newPath) && !\is_file($newPath)) {
+			throw new FilesystemException('Generated sidecar path is not a regular file: ' . $newPath);
+		}
+
+		$newStatus = 'planned';
 		if (!$dryRun) {
+			// Generated sidecars are disposable snapshots of the CURRENT desired source.
+			// They are intentionally overwritten on every run; human merge work belongs elsewhere.
 			AtomicFileWriter::write($newPath, $bytes);
+			$newStatus = 'written';
 		}
 
 		return [
-			'entry' => $base + ['applied' => 'wrote_new', 'new_path' => $newPath],
+			'entry' => $base + [
+				'applied' => 'wrote_new',
+				'new_path' => $newPath,
+				'new_status' => $newStatus,
+			],
 			'state' => null, // write_new never updates state
 		];
 	}

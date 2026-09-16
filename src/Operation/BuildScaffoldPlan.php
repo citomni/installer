@@ -19,6 +19,7 @@ use CitOmni\Installer\Support\ScaffoldRenderer;
 use CitOmni\Installer\State\ScaffoldState;
 use CitOmni\Installer\Util\Checksum;
 use CitOmni\Installer\Util\Path;
+use CitOmni\Installer\Util\PhpSourceComparator;
 use CitOmni\Installer\Exception\InstallerException;
 use CitOmni\Installer\Exception\FilesystemException;
 
@@ -102,7 +103,9 @@ final class BuildScaffoldPlan {
 	 * @param  array<string,array<string,string>> $placeholders Resolved placeholders keyed by package
 	 *                                                           name (PACKAGE_VERSION etc. already resolved per §7).
 	 * @param  array<string,mixed>               $options       ['force'=>bool, 'target'=>?string single-file scope,
-	 *                                                           'environment_materialization'=>bool].
+	 *                                                           'environment_materialization'=>bool,
+	 *                                                           'migration_reconcile'=>bool,
+	 *                                                           'migration_environment_changed'=>bool].
 	 * @return array<string,mixed>               The plan (arrays only).
 	 * @throws InstallerException  On unknown command, unsafe path, missing source, or unsafe state.
 	 */
@@ -114,13 +117,16 @@ final class BuildScaffoldPlan {
 
 		$force = (bool)($options['force'] ?? false);
 		$environmentMaterialization = (bool)($options['environment_materialization'] ?? false);
+		$migrationReconcile = $command === 'migrate' && (bool)($options['migration_reconcile'] ?? false);
+		$migrationEnvironmentChanged = $migrationReconcile && (bool)($options['migration_environment_changed'] ?? false);
 		$scope = (isset($options['target']) && \is_string($options['target']) && $options['target'] !== '')
 			? Path::normalizeRelative($options['target'])
 			: null;
 
-		// Migration deliberately rebuilds state from current manifests and disk. Legacy
-		// state is only an eligibility/backup concern and is never a planning baseline.
-		$statePackages = $command === 'migrate' ? [] : $this->state->readPackages();
+		// Legacy migration deliberately rebuilds state from current manifests and disk.
+		// Current v2 migration reconciliation keeps the recorded managed baseline so local
+		// edits remain distinguishable from clean upstream drift.
+		$statePackages = $command === 'migrate' && !$migrationReconcile ? [] : $this->state->readPackages();
 
 		$packages = [];
 		foreach ($manifests as $pkgName => $manifest) {
@@ -134,7 +140,18 @@ final class BuildScaffoldPlan {
 
 			$files = [];
 			foreach ((array)($manifest['files'] ?? []) as $file) {
-				$entry = $this->planFile($command, $packageRoot, (array)$file, $pkgPlaceholders, $pkgState, $force, $scope, $environmentMaterialization);
+				$entry = $this->planFile(
+					$command,
+					$packageRoot,
+					(array)$file,
+					$pkgPlaceholders,
+					$pkgState,
+					$force,
+					$scope,
+					$environmentMaterialization,
+					$migrationReconcile,
+					$migrationEnvironmentChanged
+				);
 				if ($entry !== null) {
 					$files[] = $entry;
 				}
@@ -166,7 +183,18 @@ final class BuildScaffoldPlan {
 	 * @return array<string,mixed>|null  Plan entry, or null when filtered out by single-file scope.
 	 * @throws InstallerException        On unsafe path, missing source, or unreadable target.
 	 */
-	private function planFile(string $command, string $packageRoot, array $file, array $pkgPlaceholders, array $pkgState, bool $force, ?string $scope, bool $environmentMaterialization): ?array {
+	private function planFile(
+		string $command,
+		string $packageRoot,
+		array $file,
+		array $pkgPlaceholders,
+		array $pkgState,
+		bool $force,
+		?string $scope,
+		bool $environmentMaterialization,
+		bool $migrationReconcile,
+		bool $migrationEnvironmentChanged
+	): ?array {
 		$target = (string)($file['target'] ?? '');
 		$source = (string)($file['source'] ?? '');
 		$type   = (string)($file['type'] ?? '');
@@ -268,6 +296,8 @@ final class BuildScaffoldPlan {
 			'exists'          => $exists,
 			'type'            => $type,
 			'policy'          => $policy,
+			'migrationReconcile' => $migrationReconcile,
+			'migrationEnvironmentChanged' => $migrationEnvironmentChanged,
 		]);
 
 		// -- 3. Assemble entry (public fields in DevKit order, then internal) -
@@ -386,9 +416,10 @@ final class BuildScaffoldPlan {
 	/**
 	 * migrate: rebuild the current baseline without trusting legacy state.
 	 *
-	 * Existing create-only files are preserved exactly like a normal install. Managed
-	 * files are authoritative from the current manifest: matching bytes are adopted,
-	 * differing bytes are backed up and replaced, and missing files are created.
+	 * Managed files remain authoritative. Existing create-only targets receive migration-only
+	 * assistance: templates are authoritative, PHP files are refreshed automatically only
+	 * when their significant token stream is unchanged, and real content/code differences
+	 * become `.new` sidecars for human review.
 	 *
 	 * @param string $policy File policy.
 	 * @param string $status Detected status with migration state intentionally ignored.
@@ -398,7 +429,15 @@ final class BuildScaffoldPlan {
 	 */
 	private function decideMigrate(string $policy, string $status, bool $environmentAware, array $ctx): array {
 		if ($policy === 'create-only') {
-			return $this->decideInstall($status, false, $ctx);
+			return $this->decideMigrateCreateOnly($status, $ctx);
+		}
+
+		if (!empty($ctx['migrationReconcile'])) {
+			if ($environmentAware && !empty($ctx['migrationEnvironmentChanged'])) {
+				return $this->decideEnvironment($status, $ctx);
+			}
+
+			return $this->decideMigrateReconcileManaged($status, $ctx);
 		}
 
 		if ($status === 'missing') {
@@ -423,6 +462,134 @@ final class BuildScaffoldPlan {
 			'action' => 'update',
 			'backup' => true,
 			'reason' => 'migration_overwrite',
+			'apply' => $apply,
+		];
+	}
+
+
+	/**
+	 * Reconcile a managed target against current v2 state and current package source.
+	 *
+	 * This is sync-like, with one migration-specific recovery guarantee: if a prior
+	 * interrupted/blocked migrate already wrote today's desired bytes but could not
+	 * commit state, the next run adopts those bytes instead of misclassifying them as
+	 * a local edit.
+	 *
+	 * @param string $status Current managed status.
+	 * @param array<string,mixed> $ctx Per-file planning context.
+	 * @return array<string,mixed>
+	 */
+	private function decideMigrateReconcileManaged(string $status, array $ctx): array {
+		switch ($status) {
+			case 'missing':
+				return $this->createWith($ctx, $ctx['pkgPlaceholders']);
+
+			case 'up_to_date':
+				$ck = $ctx['currentCk'];
+				return $this->recordedBaselineMatches($ctx, $ck)
+					? ['action' => 'none']
+					: ['action' => 'register_state', 'reason' => 'adopt_clean_baseline', 'apply' => $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck)];
+
+			case 'update_available':
+			case 'placeholder_drift':
+				return $this->updateClean($ctx);
+
+			case 'local_modified':
+			case 'unknown_existing':
+				$ck = $ctx['currentCk'] ?? $this->render($ctx['sourceAbs'], $ctx['pkgPlaceholders']);
+				$disk = (string)$ctx['disk'];
+				if (Checksum::matches($disk, $ck[1])) {
+					return [
+						'action' => 'register_state',
+						'reason' => 'adopt_current_migration_baseline',
+						'apply' => $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck),
+					];
+				}
+				$ctx['currentCk'] = $ck;
+				return $this->writeNew($ctx);
+		}
+
+		return ['action' => 'none'];
+	}
+
+
+	/**
+	 * Decide migration behavior for an existing or missing create-only target.
+	 *
+	 * @param string $status Current create-only status.
+	 * @param array<string,mixed> $ctx Per-file planning context.
+	 * @return array<string,mixed>
+	 */
+	private function decideMigrateCreateOnly(string $status, array $ctx): array {
+		if ($status === 'missing') {
+			return $this->createWith($ctx, $ctx['pkgPlaceholders']);
+		}
+
+		$stub = $this->renderer->readStub($ctx['sourceAbs']);
+		$rendered = $this->renderer->render($stub, $ctx['pkgPlaceholders']);
+		$ck = [Checksum::sha256($stub), Checksum::sha256($rendered)];
+		$disk = \file_get_contents($ctx['targetAbs']);
+		if ($disk === false) {
+			throw new FilesystemException('Cannot read create-only target during migration: ' . $ctx['normTarget']);
+		}
+
+		$ctx['disk'] = $disk;
+		$ctx['currentCk'] = $ck;
+		if (Checksum::matches($disk, $ck[1])) {
+			return [
+				'action' => 'register_state',
+				'reason' => 'adopt_clean_baseline',
+				'apply' => $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck),
+			];
+		}
+
+		$target = \strtolower($ctx['normTarget']);
+		if (\str_ends_with($target, '.tpl')) {
+			return $this->migrationOverwrite($ctx, $ck, 'migration_template_refresh');
+		}
+
+		if (\str_ends_with($target, '.php')) {
+			try {
+				$desiredTokens = PhpSourceComparator::significantTokens($rendered);
+			} catch (\ParseError $e) {
+				throw new InstallerException(
+					'Rendered migration scaffold is invalid PHP for ' . $ctx['normTarget'] . ': ' . $e->getMessage(),
+					0,
+					$e
+				);
+			}
+
+			try {
+				$localTokens = PhpSourceComparator::significantTokens($disk);
+			} catch (\ParseError) {
+				$decision = $this->writeNew($ctx);
+				$decision['reason'] = 'migration_local_php_parse_error';
+				return $decision;
+			}
+
+			if ($localTokens === $desiredTokens) {
+				return $this->migrationOverwrite($ctx, $ck, 'migration_php_nonfunctional_change');
+			}
+
+			$decision = $this->writeNew($ctx);
+			$decision['reason'] = 'migration_php_code_difference';
+			return $decision;
+		}
+
+		$decision = $this->writeNew($ctx);
+		$decision['reason'] = 'migration_content_difference';
+		return $decision;
+	}
+
+
+	/** Build a backed-up authoritative migration replacement. */
+	private function migrationOverwrite(array $ctx, array $ck, string $reason): array {
+		$apply = $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck);
+		$apply['backup_required'] = true;
+		return [
+			'action' => 'update',
+			'backup' => true,
+			'reason' => $reason,
 			'apply' => $apply,
 		];
 	}

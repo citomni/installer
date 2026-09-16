@@ -1,8 +1,9 @@
 # Environment materialization and failure recovery
 
 This describes the explicit-environment implementation and its hardening changes.
-Normal lifecycle commands use strict state format 2 without fallback. The explicit
-`migrate` command can replace known v1 materialization from current manifests.
+Normal lifecycle commands use strict state format 2 without fallback. The repeatable
+`migrate` command can rebuild known v1/no-state materialization or reconcile current
+v2 state against today's package sources and migration references.
 
 ## Commands
 
@@ -10,8 +11,9 @@ Run commands from the application root after Composer has installed its packages
 
 ```sh
 vendor/bin/citomni-installer install --environment=dev
-vendor/bin/citomni-installer migrate --environment=dev --dry-run
-vendor/bin/citomni-installer migrate --environment=dev
+vendor/bin/citomni-installer migrate --dry-run
+vendor/bin/citomni-installer migrate
+vendor/bin/citomni-installer migrate --environment=stage
 vendor/bin/citomni-installer environment stage --dry-run
 vendor/bin/citomni-installer environment stage
 vendor/bin/citomni-installer environment prod
@@ -23,12 +25,16 @@ cannot establish a global environment. Later installs may use `--package` with t
 recorded environment. `install --force` cannot switch an existing environment.
 
 
-The `migrate` command is an explicit recovery path for legacy materialization. It
-ignores legacy package/file baselines and uses the currently installed manifests and
-current placeholder resolution as the authority. Existing create-only targets are
-preserved. Managed targets are adopted when current or backed up and replaced when
-they differ. A known v1 state is backed up and removed before current v2 state is
-committed. Missing state is accepted so an interrupted migration can be resumed.
+The `migrate` command is a repeatable migration/reconciliation path. When state is
+missing or v1, legacy package/file baselines are ignored and current installed manifests
+plus current placeholder resolution are authoritative. A known v1 state is backed up
+and removed before current v2 state is committed. When state is already v2, its managed
+baselines are retained so clean upstream drift can advance safely while local managed
+edits receive `.new` instead of being overwritten. Create-only targets are re-evaluated
+against current package sources on every run; genuine local code/content differences
+remain local and receive a freshly overwritten `.new` reference. The environment defaults
+to dev when omitted. Migration also audits app-skeleton references and recursively runs
+`php -l` over app-owned `.php` and `.php.tpl` files for the report.
 
 The `environment` command selects only environment-aware manifest entries. It
 replaces differing bytes with the selected environment's rendering and backs up

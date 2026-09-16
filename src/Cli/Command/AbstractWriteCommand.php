@@ -373,6 +373,10 @@ abstract class AbstractWriteCommand {
 				}
 			}
 		}
+		$phpLint = $result['migration']['php_lint'] ?? null;
+		if (\is_array($phpLint) && (($phpLint['available'] ?? true) !== true || (int)($phpLint['failed'] ?? 0) > 0)) {
+			$hasConflict = true;
+		}
 		if ($hasIoFailure) {
 			return ExitCode::IO_ERROR->value;
 		}
@@ -412,6 +416,9 @@ abstract class AbstractWriteCommand {
 				if (isset($file['new_path'])) {
 					$out .= '      wrote:  ' . (string)$file['new_path'] . "\n";
 				}
+				if (isset($file['new_status'])) {
+					$out .= '      sidecar: ' . (string)$file['new_status'] . "\n";
+				}
 				if (isset($file['backup_path'])) {
 					$out .= '      backup: ' . (string)$file['backup_path'] . "\n";
 				}
@@ -434,6 +441,36 @@ abstract class AbstractWriteCommand {
 				$composer['applied'] ? 'applied' : ($dryRun ? 'planned' : 'not applied')
 			);
 		}
+		if (isset($result['migration']) && \is_array($result['migration'])) {
+			$migration = $result['migration'];
+			$blocking = \count((array)($migration['blocking_manual_review'] ?? []));
+			$appSkeleton = \is_array($migration['app_skeleton'] ?? null) ? $migration['app_skeleton'] : [];
+			$advisory = \count((array)($appSkeleton['manual_review'] ?? []));
+			$out .= \sprintf("\nMigration review: blocking=%d; advisory=%d.\n", $blocking, $advisory);
+			$phpLint = \is_array($migration['php_lint'] ?? null) ? $migration['php_lint'] : [];
+			if ($phpLint !== []) {
+				if (($phpLint['available'] ?? false) === true) {
+					$out .= \sprintf(
+						"PHP lint: checked=%d; passed=%d; failed=%d.\n",
+						(int)($phpLint['checked'] ?? 0),
+						(int)($phpLint['passed'] ?? 0),
+						(int)($phpLint['failed'] ?? 0)
+					);
+				} else {
+					$out .= 'PHP lint: unavailable - ' . (string)($phpLint['error'] ?? 'unknown error') . "\n";
+				}
+			}
+			if (($appSkeleton['available'] ?? true) !== true) {
+				$out .= 'App-skeleton audit: unavailable - ' . (string)($appSkeleton['error'] ?? 'unknown error') . "\n";
+			}
+			if (!empty($result['migration_report'])) {
+				$out .= 'Migration report: ' . (string)$result['migration_report'] . "\n";
+			} elseif (!empty($result['migration_report_error'])) {
+				$out .= 'Migration report: unavailable - ' . (string)$result['migration_report_error'] . "\n";
+			} elseif ($dryRun) {
+				$out .= "Migration report: not written in dry-run.\n";
+			}
+		}
 		$out .= \sprintf("\nResult: %s (exit %d)\n", $this->summaryLabel($exit, $dryRun), $exit);
 
 		\fwrite(\STDOUT, $out);
@@ -454,6 +491,7 @@ abstract class AbstractWriteCommand {
 					'applied'     => (string)($file['applied'] ?? ''),
 					'backup_path' => isset($file['backup_path']) ? (string)$file['backup_path'] : null,
 					'new_path'    => isset($file['new_path']) ? (string)$file['new_path'] : null,
+					'new_status'  => isset($file['new_status']) ? (string)$file['new_status'] : null,
 					'error_type'  => isset($file['error_type']) ? (string)$file['error_type'] : null,
 					'error'       => isset($file['error']) ? (string)$file['error'] : null,
 				];
@@ -476,6 +514,11 @@ abstract class AbstractWriteCommand {
 			'composer'      => isset($result['composer']) && \is_array($result['composer']) ? $result['composer'] : null,
 			'packages'      => $packages,
 		];
+		if (isset($result['migration']) && \is_array($result['migration'])) {
+			$payload['migration'] = $result['migration'];
+			$payload['migration_report'] = $result['migration_report'] ?? null;
+			$payload['migration_report_error'] = $result['migration_report_error'] ?? null;
+		}
 
 		\fwrite(\STDOUT, InstallerCli::encodeJson($payload) . "\n");
 	}

@@ -15,7 +15,8 @@ In practical terms, `citomni/installer` lets CitOmni keep `citomni/app-skeleton`
 ## Highlights
 
 - **Official scaffold lifecycle tool for CitOmni** with explicit ownership of scaffold discovery, rendering, planning, status, repair, sync, and state.
-- **Composer-native model** where scaffold files come from the currently installed package versions, not from live GitHub fetches or mutable remote templates.
+- **Composer-native scaffold model** where package-owned scaffold comes from the currently installed package versions, never from live GitHub templates.
+- **Migration-only app-skeleton audit** that may fetch one pinned current `citomni/app-skeleton` commit to produce advisory `.new` references for app-owned root files.
 - **Neutral app skeleton support** so `citomni/app-skeleton` can remain a thin application container instead of a pile of mode-specific runtime files.
 - **Conservative write behavior** with no blind overwrites, `.new` files for locally modified managed targets during sync, confirmation before plain forced replacement, and backups before forced overwrites.
 - **Stateful managed-file sync** using both raw stub checksums and rendered-file checksums to separate upstream scaffold drift from local changes.
@@ -66,12 +67,12 @@ No smoke, no mirrors, and preferably no wizard hat in production.
 - `doctor` for read-only environment validation.
 - `status` for read-only scaffold status.
 - `install --environment=<dev|stage|prod>` for initial scaffold and Composer materialization.
-- `migrate --environment=<dev|stage|prod>` for rebuilding legacy materialization from current manifests while preserving create-only files.
+- `migrate [--environment=<dev|stage|prod>]` for repeatable migration/reconciliation with conservative PHP comparison, refreshed `.new` review sidecars, root-reference audit, recursive PHP lint, and a Markdown report. The environment defaults to `dev`.
 - `environment <dev|stage|prod>` for authoritative switching of environment-aware targets.
 - `repair` for recreating missing scaffold files from recorded state using the currently installed package stub and the recorded placeholder snapshot.
 - `sync` for controlled updates of managed scaffold files.
 
-Post-MVP may add `diff` for comparing local files against the current rendered upstream version.
+Migration reports already include rendered diffs for files that need review. A standalone `diff` command may still be added for non-migration workflows.
 
 ### Integration output
 
@@ -214,7 +215,9 @@ Examples:
 - `bin/citomni` comes from `citomni/cli`.
 - `config/citomni_installer.php` may be added by the app to provide versioned placeholder configuration when scaffold placeholders are needed.
 
-After `composer create-project`, root-level files are app-owned. `citomni/installer` has no separate root-file mutation path: it writes only targets declared by discovered scaffold manifests. App-owned files such as `README.md`, `.gitignore`, `composer.json`, and `composer.lock` should therefore not be declared as package-owned scaffold targets.
+After `composer create-project`, root-level files are app-owned. Outside the explicit legacy `migrate` workflow, `citomni/installer` writes only targets declared by discovered scaffold manifests. App-owned files such as `README.md`, `.gitignore`, `composer.json`, and `composer.lock` should therefore not be declared as package-owned scaffold targets.
+
+During legacy migration only, the installer may compare `.gitignore`, `.gitattributes`, and `composer.json` with one pinned current `citomni/app-skeleton` commit. A difference produces an advisory sibling `<target>.new`; the live app-owned root file is never replaced by this audit.
 
 ---
 
@@ -223,6 +226,8 @@ After `composer create-project`, root-level files are app-owned. `citomni/instal
 - PHP **8.5+**
 - Composer autoloading
 - `ext-json` for JSON output
+
+`ext-curl` is optional. Legacy `migrate` uses it only for the advisory `citomni/app-skeleton` reference audit; an unavailable extension or failed GitHub request is reported without blocking package-owned scaffold migration.
 
 `citomni/installer` is intentionally independent of `citomni/cli` and `citomni/http`. It must be able to run before either runtime package has been installed in the application.
 
@@ -402,32 +407,52 @@ vendor/bin/citomni-installer install --environment=dev --package=citomni/http --
 
 ### `migrate`
 
-Rebuilds a legacy installer materialization from the currently installed package manifests. The legacy state file is not converted or used as the new baseline.
+Reconciles an application with the currently installed scaffold manifests and current
+migration reference sources. The environment defaults to `dev` when omitted.
 
-Behavior:
+The command is deliberately repeatable:
 
-- Requires an explicit `--environment=<dev|stage|prod>`.
-- Uses current manifests and current placeholder resolution as the authority.
-- Preserves every existing `create-only` target.
-- Adopts an existing managed target when its bytes already match the current rendering.
-- Backs up and replaces an existing managed target when its bytes differ.
-- Creates missing current-manifest targets.
-- Backs up a known v1 installer state before removing it.
-- Accepts missing state so an interrupted migration can be resumed.
-- Applies Composer environment posture and commits new v2 state only after scaffold and Composer succeed.
-- Rejects an application that already has current v2 state.
+- Missing state or known v1 state uses rebuild mode from current manifests.
+- Current v2 state uses reconciliation mode and keeps its managed-file baselines, so
+  clean upstream drift can move forward while locally modified managed files receive
+  `.new` instead of being overwritten.
+- Every create-only target is compared again against the current rendered source on
+  every run. Legitimate app-specific differences therefore keep appearing in the
+  report and receive a freshly generated `.new` reference each time.
+- Existing `.new` files are generated artifacts and are overwritten on every real run.
+  Do not use them as a workspace for manual merge edits.
+- Existing `.tpl` targets are authoritative package templates and are refreshed when
+  they differ.
+- `config/citomni_installer.php` is audited for missing and currently unused values.
+- `.gitignore`, `.gitattributes`, and `composer.json` are compared with one pinned
+  current `citomni/app-skeleton` commit and differing references are written as `.new`.
+- App-owned `.php` and `.php.tpl` files are recursively checked with `php -l`; vendor,
+  caches, backups, uploads, Git metadata, node_modules, and root `_...` workspaces are
+  excluded. Full lint output is stored in the migration report.
+- A Markdown audit report is written under `var/logs/citomni-installer/migrations` on
+  real runs.
 
-Preview:
+Preview using the default development environment:
 
 ```bash
-vendor/bin/citomni-installer migrate --environment=dev --dry-run
+vendor/bin/citomni-installer migrate --dry-run
 ```
 
-Apply:
+Apply using the default development environment:
 
 ```bash
-vendor/bin/citomni-installer migrate --environment=dev
+vendor/bin/citomni-installer migrate
 ```
+
+Select another environment explicitly when needed:
+
+```bash
+vendor/bin/citomni-installer migrate --environment=stage
+vendor/bin/citomni-installer migrate --environment=prod
+```
+
+A `.new` scaffold sidecar, conflict, or PHP lint failure results in exit 4 so the
+required human review cannot be missed. App-skeleton root-file differences are advisory.
 
 ### `repair`
 
