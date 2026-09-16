@@ -416,7 +416,8 @@ recorded managed baselines to protect local edits while every target is re-evalu
 against current package sources. Create-only PHP code differences are preserved and
 receive a freshly generated `<target>.new` on every real run; existing generated
 sidecars are overwritten deliberately. Existing `*.tpl` targets are authoritative
-current templates. The command also audits installer placeholders, compares root
+current templates. The command also audits installer placeholders, reports advisory
+percent-style uppercase tokens found in current package scaffold sources, compares root
 references with one pinned current citomni/app-skeleton commit, recursively runs
 `php -l` on app-owned `.php` and `.php.tpl` files, and writes a Markdown report under
 var/logs/citomni-installer/migrations/ after real runs.

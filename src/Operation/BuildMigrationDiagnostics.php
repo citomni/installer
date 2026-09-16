@@ -17,6 +17,7 @@ namespace CitOmni\Installer\Operation;
 
 use CitOmni\Installer\Enum\Environment;
 use CitOmni\Installer\Exception\FilesystemException;
+use CitOmni\Installer\Exception\InstallerException;
 use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\ScaffoldRenderer;
 use CitOmni\Installer\Util\UnifiedDiff;
@@ -29,9 +30,26 @@ use CitOmni\Installer\Util\UnifiedDiff;
  * - Separates missing installer-config values from values supplied only for the current CLI run.
  * - Reports configured placeholder keys that no current installed scaffold uses.
  * - Builds rendered target diffs from the exact source/placeholders carried by the migration plan.
+ * - Never reads local non-template var/secrets target bytes into diff diagnostics.
+ * - Omits diffs for config targets whose PHP array keys contain known sensitive credential fragments.
+ * - Flags percent-style uppercase tokens in current scaffold sources as advisory source-hygiene warnings.
  * - Produces a compact post-apply manual-review list for `.new`, conflicts, and failures.
  */
 final class BuildMigrationDiagnostics {
+
+	private const SENSITIVE_CONFIG_KEY_FRAGMENTS = [
+		'password',
+		'passwd',
+		'secret',
+		'client_secret',
+		'access_token',
+		'refresh_token',
+		'api_key',
+		'api-key',
+		'private_key',
+		'auth_token',
+	];
+
 
 	public function __construct(
 		private readonly ScaffoldRenderer $renderer,
@@ -116,6 +134,68 @@ final class BuildMigrationDiagnostics {
 
 
 	/**
+	 * Find percent-style uppercase tokens in current package scaffold sources.
+	 *
+	 * This is deliberately advisory. The current installer does not interpret `%NAME%`
+	 * tokens, but package sources may legitimately contain the syntax for another purpose.
+	 * Reporting the raw observation helps spot leftover legacy scaffold placeholders without
+	 * assigning semantics or changing migration exit behavior.
+	 *
+	 * @param array<string,array<string,mixed>> $manifests Discovered, not environment-selected manifests.
+	 * @return array{file_count:int,token_count:int,files:list<array{package:string,source:string,targets:list<string>,tokens:list<string>}>}
+	 */
+	public function inspectPercentStyleSourceTokens(array $manifests): array {
+		$sources = [];
+
+		foreach ($manifests as $packageName => $manifest) {
+			foreach ((array)($manifest['files'] ?? []) as $file) {
+				$target = (string)($file['target'] ?? '');
+
+				if (isset($file['source_path'])) {
+					$this->collectPercentStyleSource(
+						$sources,
+						(string)$packageName,
+						(string)($file['source'] ?? ''),
+						(string)$file['source_path'],
+						$target
+					);
+					continue;
+				}
+
+				foreach ((array)($file['environments'] ?? []) as $definition) {
+					if (!\is_array($definition)) {
+						continue;
+					}
+					$this->collectPercentStyleSource(
+						$sources,
+						(string)$packageName,
+						(string)($definition['source'] ?? ''),
+						(string)($definition['source_path'] ?? ''),
+						$target
+					);
+				}
+			}
+		}
+
+		$files = \array_values($sources);
+		\usort($files, static function (array $a, array $b): int {
+			$packageCompare = \strcmp($a['package'], $b['package']);
+			return $packageCompare !== 0 ? $packageCompare : \strcmp($a['source'], $b['source']);
+		});
+
+		$tokenCount = 0;
+		foreach ($files as $file) {
+			$tokenCount += \count($file['tokens']);
+		}
+
+		return [
+			'file_count' => \count($files),
+			'token_count' => $tokenCount,
+			'files' => $files,
+		];
+	}
+
+	/**
 	 * Build rendered file diffs and blocking manual-review entries from a migration plan.
 	 *
 	 * @param array<string,mixed> $plan Migration plan.
@@ -147,10 +227,33 @@ final class BuildMigrationDiagnostics {
 					continue;
 				}
 
+				if ($this->isSensitiveTarget($target)) {
+					$diffs[] = [
+						'package' => $packageName,
+						'target' => $target,
+						'action' => $action,
+						'reason' => $reason,
+						'diff_omitted_reason' => 'sensitive_target',
+					];
+					continue;
+				}
+
 				$current = \file_get_contents($targetAbs);
 				if ($current === false) {
 					throw new FilesystemException('Cannot read migration target for diff: ' . $target);
 				}
+
+				if ($this->containsSensitiveConfigKey($target, $current)) {
+					$diffs[] = [
+						'package' => $packageName,
+						'target' => $target,
+						'action' => $action,
+						'reason' => $reason,
+						'diff_omitted_reason' => 'sensitive_config_key',
+					];
+					continue;
+				}
+
 				$stub = $this->renderer->readStub($sourceAbs);
 				$desired = $this->renderer->render($stub, (array)($apply['placeholders'] ?? []));
 
@@ -171,6 +274,66 @@ final class BuildMigrationDiagnostics {
 		}
 
 		return ['scaffold_diffs' => $diffs];
+	}
+
+
+	/**
+	 * Return whether local diff bytes must never enter migration diagnostics.
+	 *
+	 * Files below var/secrets are sensitive by default. `.tpl` files are explicit
+	 * templates and may be diffed because they must not contain populated secrets.
+	 */
+	private function isSensitiveTarget(string $target): bool {
+		$normalized = \strtolower(\str_replace('\\', '/', $target));
+		return \str_starts_with($normalized, 'var/secrets/')
+			&& !\str_ends_with($normalized, '.tpl');
+	}
+
+
+	/**
+	 * Return whether a config target contains a potentially sensitive PHP array key.
+	 *
+	 * Only targets below config/ are inspected. Matching is case-insensitive and
+	 * limited to string literals used as array keys, so comments and ordinary string
+	 * values cannot suppress an otherwise useful migration diff.
+	 */
+	private function containsSensitiveConfigKey(string $target, string $bytes): bool {
+		$normalized = \strtolower(\str_replace('\\', '/', $target));
+		if (!\str_starts_with($normalized, 'config/')) {
+			return false;
+		}
+
+		$tokens = \token_get_all($bytes);
+		$count = \count($tokens);
+		for ($i = 0; $i < $count; $i++) {
+			$token = $tokens[$i];
+			if (!\is_array($token) || $token[0] !== T_CONSTANT_ENCAPSED_STRING) {
+				continue;
+			}
+
+			$next = $i + 1;
+			while ($next < $count) {
+				$candidate = $tokens[$next];
+				if (\is_array($candidate) && \in_array($candidate[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)) {
+					$next++;
+					continue;
+				}
+				break;
+			}
+
+			if ($next >= $count || !\is_array($tokens[$next]) || $tokens[$next][0] !== T_DOUBLE_ARROW) {
+				continue;
+			}
+
+			$key = \strtolower(\substr($token[1], 1, -1));
+			foreach (self::SENSITIVE_CONFIG_KEY_FRAGMENTS as $fragment) {
+				if (\str_contains($key, $fragment)) {
+					return true;
+				}
+			}
+		}
+
+		return false;
 	}
 
 
@@ -209,6 +372,43 @@ final class BuildMigrationDiagnostics {
 		return $manual;
 	}
 
+
+	/**
+	 * Collect one unique package source when it contains percent-style uppercase tokens.
+	 *
+	 * @param array<string,array{package:string,source:string,targets:list<string>,tokens:list<string>}> $sources
+	 */
+	private function collectPercentStyleSource(array &$sources, string $package, string $source, string $sourcePath, string $target): void {
+		if ($source === '' || $sourcePath === '') {
+			return;
+		}
+
+		$bytes = $this->renderer->readStub($sourcePath);
+		$matchCount = \preg_match_all('/%[A-Z][A-Z0-9_]*%/', $bytes, $matches);
+		if ($matchCount === false) {
+			throw new InstallerException('Failed to scan scaffold source for percent-style tokens: ' . $source);
+		}
+		if ($matchCount === 0) {
+			return;
+		}
+
+		$tokens = \array_values(\array_unique($matches[0]));
+		\sort($tokens, \SORT_STRING);
+		$key = $package . "\0" . $source;
+		if (!isset($sources[$key])) {
+			$sources[$key] = [
+				'package' => $package,
+				'source' => $source,
+				'targets' => [],
+				'tokens' => $tokens,
+			];
+		}
+
+		if ($target !== '' && !\in_array($target, $sources[$key]['targets'], true)) {
+			$sources[$key]['targets'][] = $target;
+			\sort($sources[$key]['targets'], \SORT_STRING);
+		}
+	}
 
 	/**
 	 * Extract placeholder usages from all source variants in discovered manifests.

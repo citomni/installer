@@ -115,18 +115,41 @@ final class MigrateCommand extends AbstractWriteCommand {
 				return $this->emptyResult($format, null);
 			}
 
+			$sourceWarnings = $this->diagnostics->inspectPercentStyleSourceTokens($discovered);
 			$configAudit = $this->diagnostics->inspectInstallerConfig($discovered, $environment, $opt['placeholders']);
 			$missing = (array)($configAudit['missing_effective_selected'] ?? []);
 			if ($missing !== []) {
-				return $this->fail(
-					$format,
-					\sprintf(
-						'Missing installer placeholders for %s: %s. Add them to config/citomni_installer.php or pass --placeholder=KEY=VALUE.',
-						$environment->value,
-						\implode(', ', $missing)
-					),
-					ExitCode::GENERAL_ERROR->value
+				$message = \sprintf(
+					'Missing installer placeholders for %s: %s. Add them to config/citomni_installer.php or pass --placeholder=KEY=VALUE.',
+					$environment->value,
+					\implode(', ', $missing)
 				);
+				$warningFiles = (int)($sourceWarnings['file_count'] ?? 0);
+				if ($warningFiles > 0) {
+					$message .= \sprintf(
+						"\n\nAdvisory: %d current scaffold source file%s contain percent-style uppercase tokens:\n",
+						$warningFiles,
+						$warningFiles === 1 ? '' : 's'
+					);
+
+					foreach ((array)($sourceWarnings['files'] ?? []) as $warning) {
+						$package = (string)($warning['package'] ?? '');
+						$source = (string)($warning['source'] ?? '');
+						$targets = \array_values(\array_filter(
+							(array)($warning['targets'] ?? []),
+							static fn(mixed $target): bool => \is_string($target) && $target !== ''
+						));
+
+						$message .= '- ' . ($package !== '' ? $package . ' — ' : '') . $source;
+						if ($targets !== []) {
+							$message .= ' → ' . \implode(', ', $targets);
+						}
+						$message .= "\n";
+					}
+
+					$message .= "\nResolve the missing placeholders and rerun migrate for the full source-warning report.";
+				}
+				return $this->fail($format, $message, ExitCode::GENERAL_ERROR->value);
 			}
 
 			$manifests = $this->locator->selectEnvironment($discovered, $environment);
@@ -175,6 +198,7 @@ final class MigrateCommand extends AbstractWriteCommand {
 				'mode' => $reconcileCurrent ? 'reconcile_v2' : 'rebuild_legacy',
 				'previous_environment' => $currentEnvironment?->value,
 				'installer_config' => $configAudit,
+				'scaffold_source_warnings' => $sourceWarnings,
 				'scaffold_diffs' => $planDiagnostics['scaffold_diffs'],
 				'blocking_manual_review' => $this->diagnostics->blockingManualReview($result),
 				'app_skeleton' => $appSkeleton,

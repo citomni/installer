@@ -19,11 +19,14 @@ use CitOmni\Installer\Exception\InstallerException;
 use CitOmni\Installer\Operation\ApplyEnvironmentMaterialization;
 use CitOmni\Installer\Operation\ApplyScaffoldPlan;
 use CitOmni\Installer\Operation\BuildScaffoldPlan;
+use CitOmni\Installer\Operation\BuildMigrationDiagnostics;
 use CitOmni\Installer\State\ScaffoldState;
 use CitOmni\Installer\Support\AtomicFileWriter;
 use CitOmni\Installer\Support\ComposerPackageDiscovery;
 use CitOmni\Installer\Support\ComposerRunner;
 use CitOmni\Installer\Support\InstallerLock;
+use CitOmni\Installer\Support\MigrationReportWriter;
+use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\ScaffoldManifestLocator;
 use CitOmni\Installer\Support\ScaffoldRenderer;
@@ -670,6 +673,162 @@ $tests['migrate PHP lint failures are reported and return manual-action exit'] =
 	check(is_file($reportPath), 'Migration with lint failure did not write its report.');
 	$report = file_get_contents($reportPath);
 	check(str_contains($report, '## PHP lint') && str_contains($report, 'src/Bad.php'), 'Migration report omitted PHP lint output.');
+};
+
+$tests['migrate lists percent-style source files when missing placeholders stop early'] = static function () use ($base): void {
+	$app = fixture($base, 'migrate-source-warning-early');
+	installed($app);
+	put(
+		$app . '/vendor/test/core/install/config.stub',
+		"<?php\n// %LEGACY_TOKEN%\nreturn ['name' => '{{MISSING_NAME}}'];\n"
+	);
+
+	[$exit, $result] = command($app, ['migrate']);
+	check($exit === 1, 'Missing placeholder did not stop migration before apply.');
+	$error = (string)($result['error'] ?? '');
+	check(str_contains($error, 'MISSING_NAME'), 'Early migration error omitted the missing placeholder.');
+	check(str_contains($error, 'test/core — install/config.stub → config/app.php'), 'Early migration error omitted the percent-style source and target.');
+};
+
+$tests['migrate reports percent-style tokens in current scaffold sources without blocking'] = static function () use ($base): void {
+	$app = fixture($base, 'migrate-source-warning');
+	installed($app);
+	put(
+		$app . '/vendor/test/core/install/config.stub',
+		"<?php\n// %LEGACY_TOKEN%\nreturn ['name' => '{{APP_NAME}}'];\n"
+	);
+
+	[$exit, $result, $output] = command($app, ['migrate']);
+	check($exit === 0, 'Advisory percent-style source token changed migrate exit behavior. ' . $output);
+	$warnings = $result['migration']['scaffold_source_warnings'] ?? null;
+	check(is_array($warnings) && ($warnings['file_count'] ?? 0) === 1, 'Migration did not report the current scaffold source warning.');
+	check(($warnings['token_count'] ?? 0) === 1, 'Migration source warning token count is wrong.');
+	check(($warnings['files'][0]['tokens'][0] ?? null) === '%LEGACY_TOKEN%', 'Migration source warning omitted the percent-style token.');
+	$reportPath = (string)($result['migration_report'] ?? '');
+	check(is_file($reportPath), 'Migration source warning did not produce its report.');
+	$report = file_get_contents($reportPath);
+	check(str_contains($report, '## Current scaffold source warnings') && str_contains($report, '%LEGACY_TOKEN%'), 'Migration report omitted the source warning details.');
+};
+
+$tests['migration diagnostics omit secret and sensitive config diffs while keeping safe diffs'] = static function () use ($base): void {
+	$app = $base . '/apps/secret-diff-redaction';
+	$pkg = $base . '/secret-diff-package';
+	mkdir($app . '/var/secrets', 0775, true);
+	mkdir($app . '/config', 0775, true);
+	mkdir($pkg, 0775, true);
+
+	$secretValue = 'LOCAL_SUPER_SECRET_123';
+	$configSecretValue = 'LOCAL_SMTP_PASSWORD_456';
+	put($app . '/var/secrets/app.secret.dev.php', "<?php return ['secret' => '{$secretValue}'];\n");
+	put($pkg . '/secret.stub', "<?php return ['secret' => 'REPLACE_ME'];\n");
+	put($app . '/var/secrets/example.php.tpl', "<?php return ['example' => 'LOCAL_TEMPLATE'];\n");
+	put($pkg . '/template.stub', "<?php return ['example' => 'CURRENT_TEMPLATE'];\n");
+	put($app . '/config/mail.php', "<?php return ['smtp' => ['smtp_password' => '{$configSecretValue}']];\n");
+	put($pkg . '/mail.stub', "<?php return ['smtp' => ['smtp_password' => 'CURRENT_PLACEHOLDER']];\n");
+	put($app . '/config/safe.php', "<?php\n// password is documentation only\nreturn ['label' => 'password', 'mode' => 'LOCAL'];\n");
+	put($pkg . '/safe.stub', "<?php return ['label' => 'password', 'mode' => 'CURRENT'];\n");
+
+	$plan = [
+		'packages' => [[
+			'name' => 'test/secrets',
+			'files' => [
+				[
+					'target' => 'var/secrets/app.secret.dev.php',
+					'action' => 'write_new',
+					'reason' => 'migration_php_code_difference',
+					'_apply' => [
+						'target_abs' => $app . '/var/secrets/app.secret.dev.php',
+						'source_abs' => $pkg . '/secret.stub',
+						'placeholders' => [],
+					],
+				],
+				[
+					'target' => 'var/secrets/example.php.tpl',
+					'action' => 'update',
+					'reason' => 'migration_template_refresh',
+					'_apply' => [
+						'target_abs' => $app . '/var/secrets/example.php.tpl',
+						'source_abs' => $pkg . '/template.stub',
+						'placeholders' => [],
+					],
+				],
+				[
+					'target' => 'config/mail.php',
+					'action' => 'write_new',
+					'reason' => 'migration_php_code_difference',
+					'_apply' => [
+						'target_abs' => $app . '/config/mail.php',
+						'source_abs' => $pkg . '/mail.stub',
+						'placeholders' => [],
+					],
+				],
+				[
+					'target' => 'config/safe.php',
+					'action' => 'write_new',
+					'reason' => 'migration_php_code_difference',
+					'_apply' => [
+						'target_abs' => $app . '/config/safe.php',
+						'source_abs' => $pkg . '/safe.stub',
+						'placeholders' => [],
+					],
+				],
+			],
+		]],
+	];
+
+	$diagnostics = new BuildMigrationDiagnostics(new ScaffoldRenderer(), new PlaceholderResolver($app));
+	$details = $diagnostics->inspectPlan($plan)['scaffold_diffs'];
+	$secret = $details[0];
+	$template = $details[1];
+	$configSecret = $details[2];
+	$safeConfig = $details[3];
+	check(($secret['diff_omitted_reason'] ?? null) === 'sensitive_target', 'Sensitive secret target was not marked as redacted.');
+	check(!isset($secret['diff']), 'Sensitive secret target still contains diff content.');
+	check(($configSecret['diff_omitted_reason'] ?? null) === 'sensitive_config_key', 'Sensitive config key was not marked as redacted.');
+	check(!isset($configSecret['diff']), 'Sensitive config target still contains diff content.');
+	$encodedDetails = json_encode($details);
+	check(!str_contains($encodedDetails, $secretValue), 'Sensitive local secret leaked into migration diagnostics JSON.');
+	check(!str_contains($encodedDetails, $configSecretValue), 'Sensitive config value leaked into migration diagnostics JSON.');
+	check(str_contains((string)($template['diff'] ?? ''), 'LOCAL_TEMPLATE'), 'Secret template target unexpectedly lost its review diff.');
+	check(str_contains((string)($safeConfig['diff'] ?? ''), "'mode' => 'LOCAL'"), 'Config comment/value containing a sensitive word incorrectly suppressed the diff.');
+
+	$result = [
+		'environment' => 'dev',
+		'ok' => false,
+		'state_written' => false,
+		'packages' => [[
+			'name' => 'test/secrets',
+			'files' => [
+				[
+					'target' => 'var/secrets/app.secret.dev.php',
+					'applied' => 'wrote_new',
+					'reason' => 'migration_php_code_difference',
+					'new_path' => $app . '/var/secrets/app.secret.dev.php.new',
+				],
+				[
+					'target' => 'config/mail.php',
+					'applied' => 'wrote_new',
+					'reason' => 'migration_php_code_difference',
+					'new_path' => $app . '/config/mail.php.new',
+				],
+			],
+		]],
+		'migration' => [
+			'mode' => 'rebuild_legacy',
+			'blocking_manual_review' => [],
+			'app_skeleton' => ['available' => false, 'manual_review' => [], 'error' => 'fixture'],
+			'installer_config' => [],
+			'php_lint' => [],
+			'scaffold_source_warnings' => ['file_count' => 0, 'files' => []],
+			'scaffold_diffs' => [$secret, $configSecret],
+		],
+	];
+	$reportPath = (new MigrationReportWriter(new PathGuard($app)))->write($result);
+	$report = file_get_contents($reportPath);
+	check(str_contains($report, 'Diff: omitted because the target is sensitive'), 'Migration report omitted the sensitive-target notice.');
+	check(str_contains($report, 'Diff: omitted because the config target contains a potentially sensitive key'), 'Migration report omitted the sensitive-config notice.');
+	check(!str_contains($report, $secretValue), 'Migration report leaked the local secret value.');
+	check(!str_contains($report, $configSecretValue), 'Migration report leaked the sensitive config value.');
 };
 
 $tests['state format and environment-switch boundaries remain strict'] = static function () use ($base): void {

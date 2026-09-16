@@ -33,8 +33,7 @@ baselines are retained so clean upstream drift can advance safely while local ma
 edits receive `.new` instead of being overwritten. Create-only targets are re-evaluated
 against current package sources on every run; genuine local code/content differences
 remain local and receive a freshly overwritten `.new` reference. The environment defaults
-to dev when omitted. Migration also audits app-skeleton references and recursively runs
-`php -l` over app-owned `.php` and `.php.tpl` files for the report.
+to dev when omitted. Migration also reports `%UPPER_SNAKE_CASE%`-style tokens found in current package scaffold sources as advisory source-hygiene warnings, audits app-skeleton references, and recursively runs `php -l` over app-owned `.php` and `.php.tpl` files for the report.
 
 The `environment` command selects only environment-aware manifest entries. It
 replaces differing bytes with the selected environment's rendering and backs up

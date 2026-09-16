@@ -424,11 +424,16 @@ The command is deliberately repeatable:
 - Existing `.tpl` targets are authoritative package templates and are refreshed when
   they differ.
 - `config/citomni_installer.php` is audited for missing and currently unused values.
+- Current package scaffold sources are scanned for `%UPPER_SNAKE_CASE%`-style tokens and reported as advisory source-hygiene warnings without changing migrate exit behavior.
 - `.gitignore`, `.gitattributes`, and `composer.json` are compared with one pinned
   current `citomni/app-skeleton` commit and differing references are written as `.new`.
 - App-owned `.php` and `.php.tpl` files are recursively checked with `php -l`; vendor,
   caches, backups, uploads, Git metadata, node_modules, and root `_...` workspaces are
   excluded. Full lint output is stored in the migration report.
+- Local diff content is omitted for non-template targets below `var/secrets`; `.tpl`
+  targets remain diffable because they are explicit templates and must not contain populated secrets.
+- Targets below `config/` also omit diff content when a PHP array key contains a known
+  credential fragment such as `password`, `secret`, `access_token`, or `api_key`.
 - A Markdown audit report is written under `var/logs/citomni-installer/migrations` on
   real runs.
 

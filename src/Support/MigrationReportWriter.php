@@ -51,6 +51,7 @@ final class MigrationReportWriter {
 		$advisory = (array)($appSkeleton['manual_review'] ?? []);
 		$config = \is_array($migration['installer_config'] ?? null) ? $migration['installer_config'] : [];
 		$phpLint = \is_array($migration['php_lint'] ?? null) ? $migration['php_lint'] : [];
+		$sourceWarnings = \is_array($migration['scaffold_source_warnings'] ?? null) ? $migration['scaffold_source_warnings'] : [];
 		$diffIndex = $this->diffIndex((array)($migration['scaffold_diffs'] ?? []));
 		$counts = $this->counts((array)($result['packages'] ?? []));
 		$generated = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format(\DATE_ATOM);
@@ -75,6 +76,7 @@ final class MigrationReportWriter {
 			$out .= '- PHP lint checked: ' . (int)($phpLint['checked'] ?? 0) . "\n";
 			$out .= '- PHP lint failed: ' . (int)($phpLint['failed'] ?? 0) . "\n";
 		}
+		$out .= '- Current scaffold sources with percent-style token warnings: ' . (int)($sourceWarnings['file_count'] ?? 0) . "\n";
 		$out .= "\n";
 
 		$out .= "## Manual review required\n\n";
@@ -140,6 +142,23 @@ final class MigrationReportWriter {
 			$out .= "Unused means no currently installed scaffold stub references the key. It is not automatically classified as deprecated.\n\n";
 		}
 
+		$out .= "## Current scaffold source warnings\n\n";
+		$warningFiles = (array)($sourceWarnings['files'] ?? []);
+		if ($warningFiles === []) {
+			$out .= "No percent-style uppercase tokens were found in current package scaffold sources.\n\n";
+		} else {
+			$out .= "Possible percent-style tokens were found in current package scaffold sources. This is advisory only; the scanner observes syntax and does not classify whether a token is intentional or leftover legacy placeholder syntax.\n\n";
+			foreach ($warningFiles as $warning) {
+				$out .= '- `' . (string)($warning['package'] ?? '') . ': ' . (string)($warning['source'] ?? '') . '` — ';
+				$out .= $this->inlineKeys((array)($warning['tokens'] ?? [])) . "\n";
+				$targets = (array)($warning['targets'] ?? []);
+				if ($targets !== []) {
+					$out .= '  - Targets: ' . \implode(', ', \array_map(static fn(string $target): string => '`' . $target . '`', $targets)) . "\n";
+				}
+			}
+			$out .= "\nThe current installer does not interpret `%NAME%` tokens. Review these package sources to determine whether each occurrence is intentional. These warnings do not affect the migrate exit code.\n\n";
+		}
+
 		$out .= "## PHP lint\n\n";
 		if ($phpLint === []) {
 			$out .= "No PHP lint diagnostics were produced.\n\n";
@@ -181,7 +200,15 @@ final class MigrationReportWriter {
 
 				$key = $packageName . "\0" . $target;
 				if (isset($diffIndex[$key])) {
-					$out .= $this->diffBlock((string)$diffIndex[$key]) . "\n";
+					$diagnostic = $diffIndex[$key];
+					$omittedReason = $diagnostic['diff_omitted_reason'] ?? null;
+					if ($omittedReason === 'sensitive_target') {
+						$out .= "- Diff: omitted because the target is sensitive\n\n";
+					} elseif ($omittedReason === 'sensitive_config_key') {
+						$out .= "- Diff: omitted because the config target contains a potentially sensitive key\n\n";
+					} elseif (isset($diagnostic['diff']) && (string)$diagnostic['diff'] !== '') {
+						$out .= $this->diffBlock((string)$diagnostic['diff']) . "\n";
+					}
 				}
 			}
 		}
@@ -248,12 +275,12 @@ final class MigrationReportWriter {
 	}
 
 
-	/** @param list<array<string,mixed>> $diffs @return array<string,string> */
+	/** @param list<array<string,mixed>> $diffs @return array<string,array<string,mixed>> */
 	private function diffIndex(array $diffs): array {
 		$index = [];
 		foreach ($diffs as $diff) {
 			$key = (string)($diff['package'] ?? '') . "\0" . (string)($diff['target'] ?? '');
-			$index[$key] = (string)($diff['diff'] ?? '');
+			$index[$key] = $diff;
 		}
 		return $index;
 	}

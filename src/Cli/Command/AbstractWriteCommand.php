@@ -460,6 +460,14 @@ abstract class AbstractWriteCommand {
 					$out .= 'PHP lint: unavailable - ' . (string)($phpLint['error'] ?? 'unknown error') . "\n";
 				}
 			}
+			$sourceWarnings = \is_array($migration['scaffold_source_warnings'] ?? null) ? $migration['scaffold_source_warnings'] : [];
+			if ((int)($sourceWarnings['file_count'] ?? 0) > 0) {
+				$out .= \sprintf(
+					"Scaffold source warnings: percent-style files=%d; tokens=%d (advisory).\n",
+					(int)($sourceWarnings['file_count'] ?? 0),
+					(int)($sourceWarnings['token_count'] ?? 0)
+				);
+			}
 			if (($appSkeleton['available'] ?? true) !== true) {
 				$out .= 'App-skeleton audit: unavailable - ' . (string)($appSkeleton['error'] ?? 'unknown error') . "\n";
 			}

@@ -37,7 +37,7 @@ final class BuildMigrationDiagnosticsTest extends TestCase {
 
 		\file_put_contents($this->packageRoot . '/dev.stub', "<?php\nreturn [];\n");
 		\file_put_contents($this->packageRoot . '/stage.stub', "<?php\nreturn [];\n");
-		\file_put_contents($this->packageRoot . '/prod.stub', "<?php\nreturn ['host' => '{{PROD_ROOT_HOST}}'];\n");
+		\file_put_contents($this->packageRoot . '/prod.stub', "<?php\n// %PROD_ROOT_URL%\nreturn ['host' => '{{PROD_ROOT_HOST}}'];\n");
 	}
 
 	protected function tearDown(): void {
@@ -51,6 +51,18 @@ final class BuildMigrationDiagnosticsTest extends TestCase {
 
 		$this->assertSame(['PROD_ROOT_URL'], $result['missing_from_config']['prod']);
 		$this->assertSame(['PROD_ROOT_URL'], $result['missing_effective_selected']);
+	}
+
+
+	public function testPercentStyleSourceTokensAreAdvisoryAndDeduplicatedPerSource(): void {
+		$result = $this->diagnostics()->inspectPercentStyleSourceTokens($this->manifests());
+
+		$this->assertSame(1, $result['file_count']);
+		$this->assertSame(1, $result['token_count']);
+		$this->assertSame('acme/pkg', $result['files'][0]['package']);
+		$this->assertSame('prod.stub', $result['files'][0]['source']);
+		$this->assertSame(['config/example.php'], $result['files'][0]['targets']);
+		$this->assertSame(['%PROD_ROOT_URL%'], $result['files'][0]['tokens']);
 	}
 
 
