@@ -31,6 +31,7 @@ use CitOmni\Installer\Exception\InstallerException;
  * - CLI overrides win over config values.
  * - Placeholder keys use ScaffoldRenderer's canonical key grammar.
  * - Placeholder values MUST be strings.
+ * - PROD_ROOT_URL and STAGE_ROOT_URL MUST NOT have a trailing slash.
  *
  * Typical usage:
  *   $resolver = new PlaceholderResolver($appRoot);
@@ -44,6 +45,12 @@ final class PlaceholderResolver {
 	private const KEY_PATTERN = '/^[A-Z][A-Z0-9_]*$/';
 
 	private const CONFIG_RELATIVE_PATH = 'config/citomni_installer.php';
+
+	/** Root URL placeholders must be canonical base URLs without a trailing slash. */
+	private const ROOT_URL_PLACEHOLDERS = [
+		'PROD_ROOT_URL' => true,
+		'STAGE_ROOT_URL' => true,
+	];
 
 	/** Derived placeholders keyed by derived host => canonical root URL source. */
 	private const DERIVED_ROOT_HOSTS = [
@@ -285,6 +292,14 @@ final class PlaceholderResolver {
 					$key,
 					$source,
 					\get_debug_type($value)
+				));
+			}
+
+			if (isset(self::ROOT_URL_PLACEHOLDERS[$key]) && \str_ends_with(\rtrim($value), '/')) {
+				throw new InstallerException(\sprintf(
+					'Placeholder {{%s}} in %s must not end with "/". Remove the trailing slash and retry.',
+					$key,
+					$source
 				));
 			}
 

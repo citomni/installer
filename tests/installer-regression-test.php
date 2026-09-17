@@ -407,6 +407,48 @@ $tests['equal bytes refresh source and placeholders for later repair'] = static 
 	[$exit, , $out] = command($app, ['repair']);
 	check($exit === 0 && file_get_contents($app . '/public/environment.txt') === 'example.test', 'Repair lost prod rendering inputs. ' . $out);
 };
+$tests['root URL placeholders reject trailing slashes'] = static function () use ($base): void {
+	$app = fixture($base, 'root-url-trailing-slash');
+
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['PROD_ROOT_URL' => 'https://www.example.test/']];");
+	try {
+		(new PlaceholderResolver($app))->resolve();
+		throw new RuntimeException('Trailing slash in PROD_ROOT_URL was accepted.');
+	} catch (InstallerException $e) {
+		check(
+			$e->getMessage() === 'Placeholder {{PROD_ROOT_URL}} in installer config must not end with "/". Remove the trailing slash and retry.',
+			'PROD_ROOT_URL trailing-slash error was not precise.'
+		);
+	}
+
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['STAGE_ROOT_URL' => 'https://stage.example.test/']];");
+	try {
+		(new PlaceholderResolver($app))->resolve();
+		throw new RuntimeException('Trailing slash in STAGE_ROOT_URL was accepted.');
+	} catch (InstallerException $e) {
+		check(
+			$e->getMessage() === 'Placeholder {{STAGE_ROOT_URL}} in installer config must not end with "/". Remove the trailing slash and retry.',
+			'STAGE_ROOT_URL trailing-slash error was not precise.'
+		);
+	}
+
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['PROD_ROOT_URL' => 'https://www.example.test', 'STAGE_ROOT_URL' => 'https://stage.example.test']];");
+	try {
+		(new PlaceholderResolver($app))->resolve(['PROD_ROOT_URL' => 'https://override.example.test/']);
+		throw new RuntimeException('Trailing slash in CLI PROD_ROOT_URL override was accepted.');
+	} catch (InstallerException $e) {
+		check(
+			$e->getMessage() === 'Placeholder {{PROD_ROOT_URL}} in CLI overrides must not end with "/". Remove the trailing slash and retry.',
+			'CLI root URL trailing-slash error was not precise.'
+		);
+	}
+
+	$resolved = (new PlaceholderResolver($app))->resolve();
+	check(($resolved['PROD_ROOT_URL'] ?? null) === 'https://www.example.test', 'Canonical PROD_ROOT_URL was not preserved.');
+	check(($resolved['PROD_ROOT_HOST'] ?? null) === 'www.example.test', 'PROD_ROOT_HOST derivation changed.');
+	check(($resolved['STAGE_ROOT_URL'] ?? null) === 'https://stage.example.test', 'Canonical STAGE_ROOT_URL was not preserved.');
+	check(($resolved['STAGE_ROOT_HOST'] ?? null) === 'stage.example.test', 'STAGE_ROOT_HOST derivation changed.');
+};
 $tests['package scope cannot establish a global initial environment'] = static function () use ($base): void {
 	$app = fixture($base, 'initial-scope');
 	[$exit] = command($app, ['install', '--environment=dev', '--package=test/core']);

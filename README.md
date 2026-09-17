@@ -715,6 +715,8 @@ Placeholder precedence, from highest to lowest:
 1. CLI `--placeholder=KEY=VALUE` options.
 2. `config/citomni_installer.php`.
 
+`PROD_ROOT_URL` and `STAGE_ROOT_URL` must be canonical base URLs without a trailing slash. The installer rejects trailing slashes from both application config and CLI overrides before scaffold rendering or materialization continues.
+
 Future versions may add Composer metadata, existing CitOmni config, or explicit package defaults.
 
 Example:
