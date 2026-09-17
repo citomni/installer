@@ -776,6 +776,64 @@ $tests['migrate reports percent-style tokens in current scaffold sources without
 	check(str_contains($report, '## Current scaffold source warnings') && str_contains($report, '%LEGACY_TOKEN%'), 'Migration report omitted the source warning details.');
 };
 
+$tests['migration report sorts create-only review by app path and uses readable unique names'] = static function () use ($base): void {
+	$app = $base . '/apps/migration-report-order';
+	mkdir($app, 0775, true);
+
+	$result = [
+		'environment' => 'dev',
+		'ok' => true,
+		'state_written' => true,
+		'packages' => [],
+		'migration' => [
+			'mode' => 'rebuild_legacy',
+			'blocking_manual_review' => [],
+			'advisory_manual_review' => [
+				['package' => 'citomni/http', 'target' => 'templates/public/helloworld.html', 'reason' => 'migration_content_difference'],
+				['package' => 'citomni/kernel', 'target' => 'config/providers.php', 'reason' => 'migration_php_code_difference'],
+				['package' => 'citomni/http', 'target' => 'src/Http/Controller/AppController.php', 'reason' => 'migration_php_code_difference'],
+				['package' => 'citomni/http', 'target' => 'config/citomni_http_cfg.php', 'reason' => 'migration_php_code_difference'],
+				['package' => 'citomni/cli', 'target' => 'config/citomni_cli_cfg.php', 'reason' => 'migration_php_code_difference'],
+			],
+			'app_skeleton' => ['available' => false, 'manual_review' => [], 'error' => 'fixture'],
+			'installer_config' => [],
+			'php_lint' => [],
+			'scaffold_source_warnings' => ['file_count' => 0, 'files' => []],
+			'scaffold_diffs' => [],
+		],
+	];
+
+	$writer = new MigrationReportWriter(new PathGuard($app));
+	$firstPath = $writer->write($result);
+	$secondPath = $writer->write($result);
+	check($firstPath !== $secondPath, 'Migration report naming reused an existing path.');
+	check(
+		preg_match('/^citomni-installer-migration-\\d{8}T\\d{4}Z(?:-\\d+)?\\.md$/', basename($firstPath)) === 1,
+		'Migration report filename is not human-readable.'
+	);
+	check(
+		preg_match('/^citomni-installer-migration-\\d{8}T\\d{4}Z(?:-\\d+)?\\.md$/', basename($secondPath)) === 1,
+		'Second migration report filename is not human-readable.'
+	);
+
+	$report = file_get_contents($firstPath);
+	$ordered = [
+		'`citomni/cli: config/citomni_cli_cfg.php`',
+		'`citomni/http: config/citomni_http_cfg.php`',
+		'`citomni/kernel: config/providers.php`',
+		'`citomni/http: src/Http/Controller/AppController.php`',
+		'`citomni/http: templates/public/helloworld.html`',
+	];
+	$previous = -1;
+	foreach ($ordered as $line) {
+		$position = strpos($report, $line);
+		check($position !== false, 'Migration report omitted expected advisory item: ' . $line);
+		check($position > $previous, 'Migration report advisory items are not sorted by app target path.');
+		$previous = $position;
+	}
+};
+
+
 $tests['migration diagnostics omit secret and sensitive config diffs while keeping safe diffs'] = static function () use ($base): void {
 	$app = $base . '/apps/secret-diff-redaction';
 	$pkg = $base . '/secret-diff-package';

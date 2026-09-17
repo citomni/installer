@@ -36,8 +36,7 @@ final class MigrationReportWriter {
 	 * @return string Absolute report path.
 	 */
 	public function write(array $result): string {
-		$timestamp = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Ymd\\THis.u\\Z');
-		$path = $this->pathGuard->resolveTarget(self::REPORT_ROOT . '/' . $timestamp . '.md');
+		$path = $this->nextReportPath(new \DateTimeImmutable('now', new \DateTimeZone('UTC')));
 		AtomicFileWriter::write($path, $this->render($result));
 		return $path;
 	}
@@ -47,7 +46,7 @@ final class MigrationReportWriter {
 	private function render(array $result): string {
 		$migration = \is_array($result['migration'] ?? null) ? $result['migration'] : [];
 		$blocking = (array)($migration['blocking_manual_review'] ?? []);
-		$advisoryScaffold = (array)($migration['advisory_manual_review'] ?? []);
+		$advisoryScaffold = $this->sortReviewItemsByTarget((array)($migration['advisory_manual_review'] ?? []));
 		$appSkeleton = \is_array($migration['app_skeleton'] ?? null) ? $migration['app_skeleton'] : [];
 		$advisory = (array)($appSkeleton['manual_review'] ?? []);
 		$config = \is_array($migration['installer_config'] ?? null) ? $migration['installer_config'] : [];
@@ -256,6 +255,36 @@ final class MigrationReportWriter {
 		}
 
 		return $out;
+	}
+
+
+	/** Return the next non-conflicting human-readable migration report path. */
+	private function nextReportPath(\DateTimeImmutable $timestamp): string {
+		$basename = 'citomni-installer-migration-' . $timestamp->format('Ymd\\THi\\Z');
+		$sequence = 1;
+
+		do {
+			$suffix = $sequence === 1 ? '' : '-' . $sequence;
+			$path = $this->pathGuard->resolveTarget(self::REPORT_ROOT . '/' . $basename . $suffix . '.md');
+			$sequence++;
+		} while (\file_exists($path));
+
+		return $path;
+	}
+
+
+	/** @param list<array<string,mixed>> $items @return list<array<string,mixed>> */
+	private function sortReviewItemsByTarget(array $items): array {
+		\usort($items, static function(array $left, array $right): int {
+			$target = \strcmp((string)($left['target'] ?? ''), (string)($right['target'] ?? ''));
+			if ($target !== 0) {
+				return $target;
+			}
+
+			return \strcmp((string)($left['package'] ?? ''), (string)($right['package'] ?? ''));
+		});
+
+		return $items;
 	}
 
 
