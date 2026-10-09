@@ -155,16 +155,20 @@ Examples:
 
 ```text
 vendor/citomni/http/install/manifest.php
-vendor/citomni/http/install/scaffold/public/index.php.stub
+vendor/citomni/http/install/scaffold/public/index.php.dev.stub
+vendor/citomni/http/install/scaffold/public/index.php.stage.stub
+vendor/citomni/http/install/scaffold/public/index.php.prod.stub
 vendor/citomni/http/install/scaffold/config/citomni_http_cfg.php.stub
 vendor/citomni/http/install/scaffold/config/citomni_http_routes.php.stub
 
 vendor/citomni/cli/install/manifest.php
-vendor/citomni/cli/install/scaffold/bin/citomni.stub
+vendor/citomni/cli/install/scaffold/bin/citomni.dev.stub
+vendor/citomni/cli/install/scaffold/bin/citomni.stage.stub
+vendor/citomni/cli/install/scaffold/bin/citomni.prod.stub
 vendor/citomni/cli/install/scaffold/config/citomni_cli_cfg.php.stub
 ```
 
-Those stubs are the package-owned reference versions. The materialized files in the app are app-local runtime artifacts derived from those stubs.
+Those stubs are the package-owned reference versions. The materialized files in the app are app-local runtime artifacts derived from those stubs. Environment-aware targets such as `public/index.php` and `bin/citomni` are materialized from the stub for the selected environment.
 
 Examples:
 
@@ -557,13 +561,17 @@ declare(strict_types=1);
 
 return [
 	'package' => 'citomni/http',
-	'version' => 1,
+	'version' => 2,
 	'files' => [
 		[
 			'target' => 'public/index.php',
-			'source' => 'install/scaffold/public/index.php.stub',
 			'type' => 'entrypoint',
 			'policy' => 'managed',
+			'environments' => [
+				'dev' => ['source' => 'install/scaffold/public/index.php.dev.stub'],
+				'stage' => ['source' => 'install/scaffold/public/index.php.stage.stub'],
+				'prod' => ['source' => 'install/scaffold/public/index.php.prod.stub'],
+			],
 		],
 		[
 			'target' => 'config/citomni_http_cfg.php',
@@ -581,7 +589,7 @@ return [
 ];
 ```
 
-`version` is the manifest schema version, not the package semver.
+`version` is the manifest schema version, not the package semver. Supported versions are `1` and `2`. `environments` requires version `2`, which also accepts entries with a plain `source`.
 
 ---
 
@@ -598,6 +606,20 @@ Targets must be safe relative app paths. Absolute paths, parent traversal, inval
 Relative path inside the package root pointing to the scaffold stub.
 
 Sources must stay inside the package root. The installer must not follow a manifest into writing or reading arbitrary system files. Manifests are configuration, not a treasure map.
+
+An entry declares either `source` or `environments`, never both.
+
+### `environments`
+
+Per-environment sources for a target whose content differs between environments, such as an entrypoint that defines `CITOMNI_ENVIRONMENT`.
+
+Rules:
+
+- Requires manifest schema version `2` and policy `managed`.
+- Must define exactly `dev`, `stage`, and `prod`.
+- Each environment must contain exactly one non-empty `source`, which follows the same rules as `source` above.
+
+`install --environment=<env>` materializes the selected environment's source. `sync` and `repair` use the recorded environment, and `environment <env>` switches environment-aware targets. See [environment materialization](docs/environment-materialization.md).
 
 ### `type`
 
