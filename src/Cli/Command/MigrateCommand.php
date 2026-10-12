@@ -39,9 +39,10 @@ use CitOmni\Installer\Support\ScaffoldManifestLocator;
  * keep their trusted managed baselines so local edits remain protected, while every
  * target is still re-evaluated against today's installed package sources. Create-only
  * code differences become freshly generated `.new` sidecars on every run. Template
- * targets remain authoritative. The installer block in an existing .gitignore is
- * refreshed; malformed block markers stop migration before writing. App-skeleton
- * references and recursive PHP lint are included in the human-review report.
+ * targets remain authoritative. The installer block in .gitignore is refreshed, and a
+ * missing .gitignore is created in a Git checkout; malformed block markers stop
+ * migration before writing. App-skeleton references and recursive PHP lint are
+ * included in the human-review report.
  */
 final class MigrateCommand extends AbstractWriteCommand {
 

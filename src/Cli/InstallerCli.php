@@ -371,7 +371,8 @@ Usage:
 Reports per file: missing, up_to_date, update_available (stub drift),
 placeholder_drift, local_modified, unknown_existing, create_only_present.
 Also compares the citomni/installer block in .gitignore with every installed
-package: up_to_date, update_available, malformed, absent (no .gitignore), or
+package: up_to_date, update_available (also a .gitignore missing in a Git
+checkout), malformed, absent (no .gitignore outside a Git checkout), or
 unsupported (for example a symlinked .gitignore, which Git does not read).
 
 Placeholder values are resolved from config/citomni_installer.php and then
@@ -400,9 +401,9 @@ stops install before writing and names every blocking target. Use the environmen
 command to switch environments. --force applies only to ordinary scaffold conflicts
 and never acts as an environment switch. Initial materialization requires all
 packages; --package is available only after an environment is recorded. Install
-also writes the citomni/installer block in an existing .gitignore from every
-installed package; malformed block markers stop it before writing. Use --dry-run
-to preview.
+also writes the citomni/installer block in .gitignore from every installed
+package, creating a missing .gitignore in a Git checkout; malformed block markers
+stop it before writing. Use --dry-run to preview.
 
 Exit codes:
   0  applied / nothing to do   4  conflicts (existing files in the way)
@@ -429,8 +430,8 @@ percent-style uppercase tokens found in current package scaffold sources, compar
 references with one pinned current citomni/app-skeleton commit while ignoring line-ending
 and one final-newline difference, recursively runs
 `php -l` on app-owned `.php` and `.php.tpl` files, refreshes the citomni/installer
-block in an existing .gitignore, and writes a Markdown report under
-var/logs/citomni-installer/migrations/ after real runs.
+block in .gitignore (creating a missing .gitignore in a Git checkout), and writes a
+Markdown report under var/logs/citomni-installer/migrations/ after real runs.
 
 Exit codes:
   0  applied / advisory review   4  blocking managed review / lint failure / conflict
@@ -487,8 +488,9 @@ baseline. Locally modified files are never overwritten by default: a sibling
 <target>.new is written instead. With --force, the existing file is backed up and
 replaced after confirmation; use --force=yes to confirm without prompting. An
 optional positional [target] limits the run to a single app-relative file. Without
-a target, sync also refreshes the citomni/installer block in an existing .gitignore
-from every installed package, also with --package. Use --dry-run to preview.
+a target, sync also refreshes the citomni/installer block in .gitignore from every
+installed package, also with --package, and creates a missing .gitignore in a Git
+checkout. Use --dry-run to preview.
 
 Exit codes:
   0  up to date / applied      4  conflicts / .new written (manual action)

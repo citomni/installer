@@ -237,7 +237,7 @@ final class MigrationReportWriter {
 				$out .= '- Error: ' . (string)$gitignore['error'] . "\n";
 			}
 			$newlyIgnored = (array)($gitignore['newly_ignored'] ?? []);
-			if (($gitignore['applied'] ?? null) === 'updated' && $newlyIgnored !== []) {
+			if (\in_array($gitignore['applied'] ?? null, ['created', 'updated'], true) && $newlyIgnored !== []) {
 				$out .= '- Newly ignored scaffold targets: ' . \implode(', ', \array_map(static fn(mixed $target): string => '`' . (string)$target . '`', $newlyIgnored)) . "\n";
 				$out .= "\nGit keeps tracking files it already tracks. Untrack these targets once with `git rm --cached --ignore-unmatch -- <path>`.\n";
 			}

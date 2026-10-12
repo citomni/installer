@@ -1283,6 +1283,136 @@ $tests['app-skeleton audit ignores the installer block and keeps it in the refer
 	check(file_get_contents($app . '/.gitignore.new') === GitignoreBlock::apply("vendor\nvar/logs\n", $body), 'The reference sidecar lost the installer block.');
 };
 
+$tests['a manifest with only gitignore rules adds its block without scaffold files or state'] = static function () use ($base): void {
+	$app = fixture($base, 'gitignore-rules-only');
+	package($app, 'test/runtime', [], [], ['/var/state/*', '!/var/state/.gitkeep']);
+	put($app . '/.gitignore', "# Application rules\n");
+
+	[$exit, $result, $output] = command($app, ['install', '--environment=dev']);
+	check($exit === 0 && ($result['gitignore']['applied'] ?? null) === 'updated', 'Install with a rules-only manifest failed. ' . $output);
+	check(in_array(['name' => 'test/runtime', 'installed_version' => '1.0.0', 'files' => []], $result['packages'], true), 'The rules-only package was not reported without files.');
+	check(!isset(ScaffoldState::forAppRoot($app)->readPackages()['test/runtime']), 'A package without scaffold files was recorded in state.');
+	$bytes = file_get_contents($app . '/.gitignore');
+	check(str_contains($bytes, "\n/var/state/*\n") && str_contains($bytes, "\n!/var/state/.gitkeep\n"), 'The rules-only manifest did not reach the block.');
+
+	[$exit, $status] = command($app, ['status']);
+	check($exit === 0 && ($status['gitignore']['status'] ?? null) === 'up_to_date', 'Status did not accept the block from a rules-only manifest.');
+	[$exit, , $output] = command($app, ['status', '--package=test/runtime'], false);
+	check($exit === 0 && str_contains($output, "\ntest/runtime\n") && str_contains($output, '.gitignore block: up_to_date'), 'Status text for a rules-only package is wrong. ' . $output);
+	[$exit, $result] = command($app, ['sync', '--package=test/runtime']);
+	check($exit === 0 && ($result['packages'] ?? null) === [['name' => 'test/runtime', 'installed_version' => '1.0.0', 'files' => []]], 'A scoped sync of a rules-only package reported files.');
+	check(($result['gitignore']['applied'] ?? null) === 'skipped' && file_get_contents($app . '/.gitignore') === $bytes, 'A scoped sync of a rules-only package changed the block.');
+};
+
+$tests['the installer manifest is validated together with package rules'] = static function () use ($base): void {
+	$manifest = require __DIR__ . '/../install/manifest.php';
+	check(($manifest['package'] ?? null) === 'citomni/installer' && ($manifest['files'] ?? null) === [], 'The installer manifest must declare runtime rules and no scaffold files.');
+
+	$app = fixture($base, 'gitignore-installer-manifest');
+	$path = $app . '/vendor/composer/installed.json';
+	$data = json_decode(file_get_contents($path), true);
+	$data['packages'][] = ['name' => 'citomni/installer', 'version' => '1.0.0', 'install-path' => realpath(__DIR__ . '/..')];
+	put($path, json_encode($data));
+	package($app, 'test/web', [], [], ['/var/secrets/*', '/var/state/*', '!/var/secrets/.gitkeep', '!/var/secrets/web.secret.php.tpl', '!/var/state/.gitkeep']);
+
+	$locator = ScaffoldManifestLocator::forAppRoot($app);
+	$rules = $locator->gitignoreRules($locator->discover());
+	$body = GitignoreBlock::body($rules['ignore'], $rules['exceptions'], $rules['targets']);
+	$expected = ['/var/backups/*', '/var/logs/*', '/var/secrets/*', '/var/state/*', '!/var/backups/.gitkeep', '!/var/logs/.gitkeep', '!/var/secrets/.gitkeep', '!/var/secrets/web.secret.php.tpl', '!/var/state/.gitkeep'];
+	check(array_values(array_filter($body, static fn(string $line): bool => str_starts_with($line, '/var/') || str_starts_with($line, '!/var/'))) === $expected, 'The installer rules did not merge with package rules: ' . implode(' ', $body));
+
+	// Every package keeps its placeholders, so a shared runtime directory must never be ignored literally.
+	package($app, 'test/literal', [], [], ['/var/state/']);
+	expectFailure(fn() => ScaffoldManifestLocator::forAppRoot($app)->discover(), 'A literal ignore of a shared runtime directory was accepted next to kept placeholders.');
+};
+
+$tests['a missing gitignore is created in a Git checkout'] = static function () use ($base): void {
+	$app = fixture($base, 'gitignore-checkout');
+	mkdir($app . '/.git');
+	$block = GitignoreBlock::apply('', GitignoreBlock::body([], [], ['bin/tool', 'public/environment.txt']));
+
+	[$exit, $status] = command($app, ['status', '--environment=dev']);
+	check($exit === 3 && ($status['gitignore']['status'] ?? null) === 'update_available' && ($status['gitignore']['reason'] ?? null) === 'gitignore_missing', 'Status did not report a .gitignore missing in a Git checkout.');
+	check(($status['gitignore']['newly_ignored'] ?? null) === ['bin/tool', 'public/environment.txt'], 'Status did not list what a new .gitignore would ignore.');
+	[$exit, $result] = command($app, ['install', '--environment=dev', '--dry-run']);
+	check($exit === 0 && ($result['gitignore']['applied'] ?? null) === 'created' && !file_exists($app . '/.gitignore'), 'Dry-run install wrote a .gitignore.');
+
+	[$exit, $result, $output] = command($app, ['install', '--environment=dev']);
+	check($exit === 0 && ($result['gitignore']['action'] ?? null) === 'create' && ($result['gitignore']['applied'] ?? null) === 'created', 'Install did not create the .gitignore. ' . $output);
+	check(file_get_contents($app . '/.gitignore') === $block, 'The created .gitignore does not hold exactly the block.');
+	[$exit, $status] = command($app, ['status']);
+	check($exit === 0 && ($status['gitignore']['status'] ?? null) === 'up_to_date', 'Status did not accept the created .gitignore.');
+
+	foreach ([['sync'], ['migrate']] as $args) {
+		unlink($app . '/.gitignore');
+		[$exit, $status] = command($app, ['status']);
+		check($exit === 3 && ($status['gitignore']['reason'] ?? null) === 'gitignore_missing', 'Status did not report a deleted .gitignore as drift.');
+		[, $result, $output] = command($app, $args);
+		check(($result['gitignore']['applied'] ?? null) === 'created' && file_get_contents($app . '/.gitignore') === $block, implode(' ', $args) . ' did not recreate the .gitignore. ' . $output);
+	}
+	unlink($app . '/.gitignore');
+	[$exit, $result] = command($app, ['sync', 'bin/tool']);
+	check($exit === 0 && $result['gitignore'] === null && !file_exists($app . '/.gitignore'), 'A single-target sync created the .gitignore.');
+	[$exit, $result] = command($app, ['repair']);
+	check($exit === 0 && !file_exists($app . '/.gitignore'), 'Repair created the .gitignore.');
+
+	// Linked worktrees and submodules use a .git file; a checkout may also start above the app root.
+	$worktree = fixture($base, 'gitignore-worktree');
+	put($worktree . '/.git', "gitdir: ../elsewhere/.git/worktrees/app\n");
+	$nested = fixture($base, 'gitignore-parent-checkout/app');
+	mkdir(dirname($nested) . '/.git');
+	foreach ([$worktree, $nested] as $root) {
+		[$exit, $result, $output] = command($root, ['install', '--environment=dev']);
+		check($exit === 0 && ($result['gitignore']['applied'] ?? null) === 'created' && file_get_contents($root . '/.gitignore') === $block, 'Install did not create the .gitignore in ' . $root . '. ' . $output);
+	}
+
+	// An empty block never creates a file.
+	$empty = $base . '/apps/gitignore-checkout-empty';
+	put($empty . '/composer.json', json_encode(['name' => 'test/app', 'config' => ['classmap-authoritative' => false]]));
+	package($empty, 'test/owned', [['target' => 'config/owned.php', 'source' => 'install/owned.stub', 'type' => 'config', 'policy' => 'create-only']], ['install/owned.stub' => "<?php return [];\n"]);
+	mkdir($empty . '/.git');
+	[$exit, $result, $output] = command($empty, ['install', '--environment=dev']);
+	check($exit === 0 && ($result['gitignore']['status'] ?? null) === 'absent' && !file_exists($empty . '/.gitignore'), 'An empty block created a .gitignore. ' . $output);
+};
+
+$tests['a missing gitignore stays absent outside a Git checkout'] = static function () use ($base): void {
+	$app = fixture($base, 'gitignore-no-checkout');
+	for ($directory = (string)realpath($app); ; $directory = dirname($directory)) {
+		if (file_exists($directory . '/.git')) {
+			echo "  SKIP Missing .gitignore outside a Git checkout (the temp directory is inside one).\n";
+			return;
+		}
+		if (dirname($directory) === $directory) {
+			break;
+		}
+	}
+
+	[$exit, $result, $output] = command($app, ['install', '--environment=dev']);
+	check($exit === 0 && ($result['gitignore']['status'] ?? null) === 'absent' && ($result['gitignore']['applied'] ?? null) === 'skipped', 'Install did not leave a missing .gitignore absent. ' . $output);
+	[$exit, $status] = command($app, ['status']);
+	check($exit === 0 && ($status['gitignore']['status'] ?? null) === 'absent' && ($status['gitignore']['reason'] ?? null) === 'gitignore_missing', 'Status reported a missing .gitignore outside a Git checkout as a finding.');
+	[$exit] = command($app, ['sync']);
+	check($exit === 0 && !file_exists($app . '/.gitignore'), 'Sync created a .gitignore outside a Git checkout.');
+};
+
+$tests['the installer block follows a leading app-skeleton block'] = static function () use ($base): void {
+	$app = fixture($base, 'gitignore-three-tiers');
+	package($app, 'test/runtime', [], [], ['/var/cache/*', '!/var/cache/.gitkeep']);
+	$skeleton = "###> citomni/app-skeleton ###\n# Defaults from citomni/app-skeleton.\n/vendor/\n/var/cache/*\n!/var/cache/.gitkeep\n###< citomni/app-skeleton ###\n";
+	$appRules = "# Application rules: everything below takes precedence over both blocks above.\n!/var/cache/fixture.json\n";
+	put($app . '/.gitignore', $skeleton . "\n" . $appRules);
+
+	[$exit, , $output] = command($app, ['install', '--environment=dev']);
+	check($exit === 0, 'Install with a skeleton block failed. ' . $output);
+	$bytes = file_get_contents($app . '/.gitignore');
+	$block = GitignoreBlock::apply('', GitignoreBlock::body(['/var/cache/*'], ['!/var/cache/.gitkeep'], ['bin/tool', 'public/environment.txt']));
+	check($bytes === $skeleton . "\n" . $block . "\n" . $appRules, 'The block did not land between the skeleton block and the application rules.');
+
+	[$exit, $result] = command($app, ['sync']);
+	check($exit === 0 && ($result['gitignore']['applied'] ?? null) === 'skipped' && file_get_contents($app . '/.gitignore') === $bytes, 'A second run moved or rewrote the block.');
+	check(GitignoreBlock::remove($bytes) === $skeleton . "\n" . $appRules, 'Removing the block did not restore the skeleton and application tiers.');
+};
+
 
 // Optional actual Composer verification, separate from deterministic failure injection.
 foreach (array_slice($argv, 1) as $argument) {

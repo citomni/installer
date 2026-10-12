@@ -632,7 +632,7 @@ abstract class AbstractWriteCommand {
 		}
 
 		$newlyIgnored = (array)($block['newly_ignored'] ?? []);
-		if ($applied === 'updated' && $newlyIgnored !== []) {
+		if (($applied === 'created' || $applied === 'updated') && $newlyIgnored !== []) {
 			foreach ($newlyIgnored as $target) {
 				$out .= '      now ignored: ' . (string)$target . "\n";
 			}

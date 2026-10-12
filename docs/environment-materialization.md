@@ -161,7 +161,9 @@ php tests/installer-regression-test.php --composer=/absolute/path/to/composer.ph
 The optional case isolates COMPOSER_HOME and runs only config and dump-autoload on
 local fixtures; it does not resolve or download dependencies. The selected PHAR must
 be runnable by the PHP binary executing the tests. Windows-specific and symlink
-checks report a skip when their platform/capability is unavailable.
+checks report a skip when their platform/capability is unavailable. The check that a
+missing `.gitignore` stays absent outside a Git checkout skips when the system temp
+directory itself lies inside one.
 
 The application-level Windows test still runs from the disposable lab application:
 

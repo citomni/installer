@@ -52,8 +52,9 @@ use CitOmni\Installer\Exception\ConflictException;
  *        from plan time.
  *     5) none / conflict -> no write. Environment no-ops still verify their snapshots.
  * - A planned `.gitignore` block update rewrites only the installer block, after the
- *   file was rechecked against its planned bytes. It has no backup and no state; its
- *   outcome is reported under `gitignore` and counts toward `ok` like a file.
+ *   file was rechecked against its planned bytes; a planned creation writes a new
+ *   `.gitignore` holding only the block. Neither has a backup or state; the outcome is
+ *   reported under `gitignore` and counts toward `ok` like a file.
  * - Re-resolves every write destination through PathGuard at the write site, so the
  *   "never write outside app-root / never write to /vendor/" invariant is enforced
  *   at the point of mutation, not only at plan time.
@@ -116,7 +117,7 @@ final class ApplyScaffoldPlan {
 	 *                where each file gains an `applied` outcome (created|updated|wrote_new|
 	 *                registered|skipped|conflict|failed) plus optional backup_path/new_path/error.
 	 *                `gitignore` is present when the plan has a block entry and carries an
-	 *                `applied` outcome of updated|skipped|conflict|failed.
+	 *                `applied` outcome of created|updated|skipped|conflict|failed.
 	 * @throws InstallerException  If the existing state file is present but unreadable/unsafe,
 	 *                             or if the final state write fails.
 	 */
@@ -468,14 +469,16 @@ final class ApplyScaffoldPlan {
 	}
 
 	/**
-	 * Rewrite the installer block in .gitignore as planned.
+	 * Write the installer block in .gitignore as planned.
 	 *
 	 * Behavior:
 	 * - Rechecks the planned path and bytes first, so an edit after planning becomes a
 	 *   conflict instead of being overwritten. A .gitignore that became a symlink is a
 	 *   conflict too, because Git would not read a block written behind it.
-	 * - Recomputes the file from its current bytes and writes it atomically; bytes outside
-	 *   the block are preserved.
+	 * - `update` recomputes the file from its current bytes and writes it atomically; bytes
+	 *   outside the block are preserved.
+	 * - `create` writes a new .gitignore that contains only the block. A file that
+	 *   appeared since planning is a conflict and is left untouched.
 	 * - Failures are reported on the entry, like per-file failures, and never thrown.
 	 *
 	 * @param array<string,mixed> $entry Planned block entry from BuildScaffoldPlan.
@@ -504,7 +507,7 @@ final class ApplyScaffoldPlan {
 		}
 
 		$apply = $entry['_apply'] ?? null;
-		if ($action !== 'update' || !\is_array($apply)) {
+		if (($action !== 'create' && $action !== 'update') || !\is_array($apply)) {
 			return $base + ['applied' => 'failed', 'error_type' => 'general', 'error' => "unsupported .gitignore block action '{$action}'"];
 		}
 
@@ -514,8 +517,9 @@ final class ApplyScaffoldPlan {
 			if (\is_link($link)) {
 				throw new ConflictException(GitignoreBlock::FILE . ' became a symlink since planning. Re-run the command.');
 			}
+			// The freshness check confirmed that the planned file still exists, or still does not.
 			$path = $this->assertTargetFresh($apply);
-			$bytes = \file_get_contents($path);
+			$bytes = $apply['target_exists'] ? \file_get_contents($path) : '';
 			if ($bytes === false) {
 				throw new FilesystemException('Unable to read ' . GitignoreBlock::FILE . ' before apply.');
 			}
@@ -531,7 +535,7 @@ final class ApplyScaffoldPlan {
 			];
 		}
 
-		return $base + ['applied' => 'updated'];
+		return $base + ['applied' => $action === 'create' ? 'created' : 'updated'];
 	}
 
 

@@ -37,9 +37,10 @@ use CitOmni\Installer\Support\InstallerLock;
  * from another environment is routed to the dedicated `environment <env>` command
  * instead of being overwritten by --force.
  *
- * Install also maintains the installer block in an existing .gitignore, planned from
- * every installed package even when --package narrows the scaffold files. Malformed
- * block markers stop install before writing, like an environment conflict.
+ * Install also maintains the installer block in .gitignore, planned from every
+ * installed package even when --package narrows the scaffold files, and creates a
+ * missing .gitignore in a Git checkout. Malformed block markers stop install before
+ * writing, like an environment conflict.
  */
 final class InstallCommand extends AbstractWriteCommand {
 

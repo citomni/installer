@@ -823,7 +823,10 @@ final class BuildScaffoldPlan {
 	 * Plan the installer-owned block in the application's .gitignore.
 	 *
 	 * Behavior:
-	 * - A missing .gitignore is never created; the block is reported as `absent`.
+	 * - A missing .gitignore in a Git checkout is created with the block alone
+	 *   (`update_available`, reason `gitignore_missing`, action `create`). Outside a Git
+	 *   checkout, such as an exported build or a deploy tree, and whenever the block would
+	 *   be empty, a missing .gitignore is reported as `absent` and left missing.
 	 * - A .gitignore the installer cannot maintain is reported as `unsupported` and left
 	 *   alone; it never fails the command. That covers a symlink, which Git does not read
 	 *   from the working tree, a path PathGuard rejects, a non-regular file, and
@@ -836,7 +839,7 @@ final class BuildScaffoldPlan {
 	 *
 	 * @param string $command Planner command.
 	 * @param array<string,mixed> $rules Output of ScaffoldManifestLocator::gitignoreRules().
-	 * @return array<string,mixed> Block entry; `_apply` is present only for an update.
+	 * @return array<string,mixed> Block entry; `_apply` is present only for a create or update.
 	 * @throws InstallerException When a managed target cannot be expressed as a .gitignore line.
 	 */
 	private function planGitignore(string $command, array $rules): array {
@@ -868,11 +871,13 @@ final class BuildScaffoldPlan {
 		if (\file_exists($path) && !\is_file($path)) {
 			return $unsupported('gitignore_not_regular_file', 'Not a regular file: ' . GitignoreBlock::FILE);
 		}
-		if (!\is_file($path)) {
+
+		$exists = \is_file($path);
+		if (!$exists && ($body === [] || !$this->insideGitCheckout())) {
 			return $entry + ['status' => 'absent', 'reason' => 'gitignore_missing', 'action' => 'none', 'newly_ignored' => []];
 		}
 
-		$bytes = @\file_get_contents($path);
+		$bytes = $exists ? @\file_get_contents($path) : '';
 		if ($bytes === false) {
 			return $unsupported('gitignore_unreadable', 'Cannot read ' . GitignoreBlock::FILE . '.');
 		}
@@ -905,21 +910,57 @@ final class BuildScaffoldPlan {
 
 		$entry += [
 			'status' => 'update_available',
-			'reason' => $current === null ? 'block_missing' : ($body === [] ? 'block_obsolete' : 'block_drift'),
-			'action' => $command === 'status' ? 'none' : 'update',
+			'reason' => match (true) {
+				!$exists => 'gitignore_missing',
+				$current === null => 'block_missing',
+				$body === [] => 'block_obsolete',
+				default => 'block_drift',
+			},
+			'action' => $command === 'status' ? 'none' : ($exists ? 'update' : 'create'),
 			'newly_ignored' => $newlyIgnored,
 		];
-		if ($entry['action'] === 'update') {
+		if ($entry['action'] !== 'none') {
 			$entry['_apply'] = [
 				'target' => GitignoreBlock::FILE,
 				'target_abs' => $path,
-				'target_exists' => true,
+				'target_exists' => $exists,
 				'target_checksum' => Checksum::sha256($bytes),
 				'body' => $body,
 			];
 		}
 
 		return $entry;
+	}
+
+
+	/**
+	 * Return whether the application root lies inside a Git checkout.
+	 *
+	 * Behavior:
+	 * - Looks for a `.git` entry in the application root and in every parent directory up
+	 *   to the filesystem root. A directory marks a repository; a file marks a linked
+	 *   worktree or a submodule.
+	 *
+	 * Notes:
+	 * - Presence only: Git is neither run nor required, and the repository is not
+	 *   validated. Walks the resolved application root, like Git's own discovery.
+	 * - Probes are silent, so an open_basedir restriction reads as "no .git here" instead
+	 *   of printing warnings into JSON output.
+	 *
+	 * @return bool True when a `.git` directory or file exists at or above the app root.
+	 */
+	private function insideGitCheckout(): bool {
+		$directory = $this->pathGuard->appRoot();
+		while (true) {
+			if (@\file_exists($directory . '/.git')) {
+				return true;
+			}
+			$parent = \dirname($directory);
+			if ($parent === $directory) {
+				return false;
+			}
+			$directory = $parent;
+		}
 	}
 
 

@@ -192,8 +192,9 @@ final class StatusCommand {
 	/**
 	 * Derive scaffold exit code from plan statuses.
 	 *
-	 * The .gitignore block counts like a file: a stale block is drift, malformed
-	 * markers are a conflict, and a missing or unsupported .gitignore is not a finding.
+	 * The .gitignore block counts like a file: a stale block, or a .gitignore missing in
+	 * a Git checkout, is drift; malformed markers are a conflict. A .gitignore missing
+	 * outside a Git checkout, or one the installer cannot maintain, is not a finding.
 	 *
 	 * @param array<string,mixed> $plan Status plan.
 	 * @return int

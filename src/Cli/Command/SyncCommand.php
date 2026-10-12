@@ -23,8 +23,8 @@ namespace CitOmni\Installer\Cli\Command;
  * overwritten: ApplyScaffoldPlan writes a sibling <target>.new instead, unless
  * --force is given (which backs up the existing file first). Accepts an optional
  * positional [target] to limit the run to a single app-relative file. Without a
- * target, sync also refreshes the installer block in an existing .gitignore. All
- * transport logic lives in AbstractWriteCommand.
+ * target, sync also refreshes the installer block in .gitignore and creates a missing
+ * .gitignore in a Git checkout. All transport logic lives in AbstractWriteCommand.
  */
 final class SyncCommand extends AbstractWriteCommand {
 
