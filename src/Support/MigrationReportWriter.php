@@ -228,6 +228,22 @@ final class MigrationReportWriter {
 			}
 		}
 
+		$gitignore = \is_array($result['gitignore'] ?? null) ? $result['gitignore'] : null;
+		if ($gitignore !== null) {
+			$out .= "## .gitignore block\n\n";
+			$out .= '- Result: `' . (string)($gitignore['applied'] ?? '') . "`\n";
+			$out .= '- Reason: `' . (string)($gitignore['reason'] ?? '') . "`\n";
+			if (isset($gitignore['error'])) {
+				$out .= '- Error: ' . (string)$gitignore['error'] . "\n";
+			}
+			$newlyIgnored = (array)($gitignore['newly_ignored'] ?? []);
+			if (($gitignore['applied'] ?? null) === 'updated' && $newlyIgnored !== []) {
+				$out .= '- Newly ignored scaffold targets: ' . \implode(', ', \array_map(static fn(mixed $target): string => '`' . (string)$target . '`', $newlyIgnored)) . "\n";
+				$out .= "\nGit keeps tracking files it already tracks. Untrack these targets once with `git rm --cached --ignore-unmatch -- <path>`.\n";
+			}
+			$out .= "\n";
+		}
+
 		$out .= "## citomni/app-skeleton reference audit\n\n";
 		if (($appSkeleton['available'] ?? false) !== true) {
 			$out .= 'Reference audit unavailable: ' . (string)($appSkeleton['error'] ?? 'unknown error') . "\n";

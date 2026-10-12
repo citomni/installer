@@ -20,6 +20,7 @@ use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\ScaffoldRenderer;
 use CitOmni\Installer\State\ScaffoldState;
 use CitOmni\Installer\Util\Checksum;
+use CitOmni\Installer\Util\GitignoreBlock;
 use CitOmni\Installer\Exception\InstallerException;
 use CitOmni\Installer\Exception\FilesystemException;
 use CitOmni\Installer\Exception\ConflictException;
@@ -50,6 +51,9 @@ use CitOmni\Installer\Exception\ConflictException;
  *        ones, so an adopted baseline is verified against disk at apply time, not trusted
  *        from plan time.
  *     5) none / conflict -> no write. Environment no-ops still verify their snapshots.
+ * - A planned `.gitignore` block update rewrites only the installer block, after the
+ *   file was rechecked against its planned bytes. It has no backup and no state; its
+ *   outcome is reported under `gitignore` and counts toward `ok` like a file.
  * - Re-resolves every write destination through PathGuard at the write site, so the
  *   "never write outside app-root / never write to /vendor/" invariant is enforced
  *   at the point of mutation, not only at plan time.
@@ -108,9 +112,11 @@ final class ApplyScaffoldPlan {
 	 *                          carries action/status/policy and an optional `_apply` block.
 	 * @param  array  $options  {dry_run?: bool, persist_state?: bool}. In dry-run, stubs are still rendered and
 	 *                          validated (so problems surface) but nothing is written.
-	 * @return array  Result: {command, dry_run, ok, backup_dir, state_written, packages[]},
+	 * @return array  Result: {command, dry_run, ok, backup_dir, state_written, packages[], gitignore?},
 	 *                where each file gains an `applied` outcome (created|updated|wrote_new|
 	 *                registered|skipped|conflict|failed) plus optional backup_path/new_path/error.
+	 *                `gitignore` is present when the plan has a block entry and carries an
+	 *                `applied` outcome of updated|skipped|conflict|failed.
 	 * @throws InstallerException  If the existing state file is present but unreadable/unsafe,
 	 *                             or if the final state write fails.
 	 */
@@ -212,6 +218,14 @@ final class ApplyScaffoldPlan {
 			];
 		}
 
+		$gitignore = null;
+		if (\is_array($plan['gitignore'] ?? null)) {
+			$gitignore = $this->applyGitignore($plan['gitignore'], $dryRun);
+			if ($gitignore['applied'] === 'failed' || $gitignore['applied'] === 'conflict') {
+				$ok = false;
+			}
+		}
+
 		// -- 3. Persist state once (only if something actually changed) -------------------
 		$stateWritten = false;
 		if (!$dryRun && $persistState && $stateDirty) {
@@ -227,6 +241,9 @@ final class ApplyScaffoldPlan {
 			'state_written' => $stateWritten,
 			'packages'      => $resultPackages,
 		];
+		if ($gitignore !== null) {
+			$result['gitignore'] = $gitignore;
+		}
 
 		if (!$persistState) {
 			$result['_state_packages'] = $statePackages;
@@ -448,6 +465,73 @@ final class ApplyScaffoldPlan {
 				'data'   => $this->buildStateData($base['type'], $base['policy'], $source, $placeholders, $stubCk, $renderedCk, $now),
 			],
 		];
+	}
+
+	/**
+	 * Rewrite the installer block in .gitignore as planned.
+	 *
+	 * Behavior:
+	 * - Rechecks the planned path and bytes first, so an edit after planning becomes a
+	 *   conflict instead of being overwritten. A .gitignore that became a symlink is a
+	 *   conflict too, because Git would not read a block written behind it.
+	 * - Recomputes the file from its current bytes and writes it atomically; bytes outside
+	 *   the block are preserved.
+	 * - Failures are reported on the entry, like per-file failures, and never thrown.
+	 *
+	 * @param array<string,mixed> $entry Planned block entry from BuildScaffoldPlan.
+	 * @param bool $dryRun Whether to validate without writing.
+	 * @return array<string,mixed> Public block fields plus `applied` and optional error_type/error.
+	 */
+	private function applyGitignore(array $entry, bool $dryRun): array {
+		$action = (string)($entry['action'] ?? 'none');
+		$base = [
+			'target' => (string)($entry['target'] ?? GitignoreBlock::FILE),
+			'status' => (string)($entry['status'] ?? ''),
+			'reason' => (string)($entry['reason'] ?? ''),
+			'action' => $action,
+			'newly_ignored' => \array_values((array)($entry['newly_ignored'] ?? [])),
+		];
+
+		if ($action === 'none') {
+			return $base + ['applied' => 'skipped'];
+		}
+		if ($action === 'conflict') {
+			$conflict = $base + ['applied' => 'conflict', 'error_type' => 'conflict'];
+			if (isset($entry['error'])) {
+				$conflict['error'] = (string)$entry['error'];
+			}
+			return $conflict;
+		}
+
+		$apply = $entry['_apply'] ?? null;
+		if ($action !== 'update' || !\is_array($apply)) {
+			return $base + ['applied' => 'failed', 'error_type' => 'general', 'error' => "unsupported .gitignore block action '{$action}'"];
+		}
+
+		try {
+			$link = $this->pathGuard->appRoot() . '/' . GitignoreBlock::FILE;
+			\clearstatcache(true, $link);
+			if (\is_link($link)) {
+				throw new ConflictException(GitignoreBlock::FILE . ' became a symlink since planning. Re-run the command.');
+			}
+			$path = $this->assertTargetFresh($apply);
+			$bytes = \file_get_contents($path);
+			if ($bytes === false) {
+				throw new FilesystemException('Unable to read ' . GitignoreBlock::FILE . ' before apply.');
+			}
+			$updated = GitignoreBlock::apply($bytes, (array)($apply['body'] ?? []));
+			if (!$dryRun) {
+				AtomicFileWriter::write($path, $updated);
+			}
+		} catch (InstallerException $e) {
+			return $base + [
+				'applied' => $e instanceof ConflictException ? 'conflict' : 'failed',
+				'error_type' => $e instanceof FilesystemException ? 'io' : ($e instanceof ConflictException ? 'conflict' : 'general'),
+				'error' => $e->getMessage(),
+			];
+		}
+
+		return $base + ['applied' => 'updated'];
 	}
 
 

@@ -22,7 +22,8 @@ namespace CitOmni\Installer\Cli\Command;
  * disk still matches its recorded baseline. Locally modified files are never
  * overwritten: ApplyScaffoldPlan writes a sibling <target>.new instead, unless
  * --force is given (which backs up the existing file first). Accepts an optional
- * positional [target] to limit the run to a single app-relative file. All
+ * positional [target] to limit the run to a single app-relative file. Without a
+ * target, sync also refreshes the installer block in an existing .gitignore. All
  * transport logic lives in AbstractWriteCommand.
  */
 final class SyncCommand extends AbstractWriteCommand {
@@ -32,6 +33,10 @@ final class SyncCommand extends AbstractWriteCommand {
 	}
 
 	protected function acceptsPositionalTarget(): bool {
+		return true;
+	}
+
+	protected function maintainsGitignore(): bool {
 		return true;
 	}
 }

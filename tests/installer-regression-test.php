@@ -31,6 +31,7 @@ use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\ScaffoldManifestLocator;
 use CitOmni\Installer\Support\ScaffoldRenderer;
+use CitOmni\Installer\Util\GitignoreBlock;
 use CitOmni\Installer\Util\Path;
 
 // Test-local autoloading exercises this checkout without installing or booting an app.
@@ -123,16 +124,25 @@ function command(string $app, array $args, bool $json = true): array {
 }
 
 /** Add an installed Composer package with a schema 2 scaffold manifest. */
-function package(string $app, string $name, array $files, array $stubs): void {
+function package(string $app, string $name, array $files, array $stubs, ?array $gitignore = null): void {
 	$root = $app . '/vendor/' . $name;
 	foreach ($stubs as $path => $bytes) {
 		put($root . '/' . $path, $bytes);
 	}
-	put($root . '/install/manifest.php', '<?php return ' . var_export(['package' => $name, 'version' => 2, 'files' => $files], true) . ';');
+	manifest($app, $name, $files, $gitignore);
 	$path = $app . '/vendor/composer/installed.json';
 	$data = is_file($path) ? json_decode(file_get_contents($path), true) : ['packages' => []];
 	$data['packages'][] = ['name' => $name, 'version' => '1.0.0', 'install-path' => '../' . $name];
 	put($path, json_encode($data));
+}
+
+/** Write (or rewrite) one installed package's schema 2 manifest. */
+function manifest(string $app, string $name, array $files, ?array $gitignore = null): void {
+	$manifest = ['package' => $name, 'version' => 2, 'files' => $files];
+	if ($gitignore !== null) {
+		$manifest['gitignore'] = $gitignore;
+	}
+	put($app . '/vendor/' . $name . '/install/manifest.php', '<?php return ' . var_export($manifest, true) . ';');
 }
 
 /** Make an isolated app containing both scaffold policies and environment-aware files. */
@@ -966,6 +976,311 @@ $tests['state format and environment-switch boundaries remain strict'] = static 
 	put($state->path(), "<?php return ['format_version' => 1, 'packages' => []];");
 	[$exit] = command($app, ['environment', 'prod']);
 	check($exit === 5, 'Legacy state was migrated or accepted.');
+};
+
+$tests['install leaves a clean drifted environment baseline to sync'] = static function () use ($base): void {
+	$app = fixture($base, 'environment-drift');
+	installed($app);
+	put($app . '/vendor/test/core/install/dev.stub', "dev version 2\n");
+
+	[$exit, $result, $output] = command($app, ['install', '--environment=dev']);
+	check($exit === 0, 'Install treated a clean drifted baseline of the same environment as a conflict. ' . $output);
+	$target = resultFile($result, 'public/environment.txt');
+	check($target['status'] === 'update_available' && $target['applied'] === 'skipped', 'Install did not leave the drifted environment target to sync.');
+	check(file_get_contents($app . '/public/environment.txt') === "dev\n", 'Install rewrote a clean drifted environment target.');
+
+	[$exit] = command($app, ['status']);
+	check($exit === 3, 'Status did not report the drifted environment target as an update.');
+	[$exit, , $output] = command($app, ['sync']);
+	check($exit === 0 && file_get_contents($app . '/public/environment.txt') === "dev version 2\n", 'Sync did not update the drifted environment target. ' . $output);
+};
+
+$tests['install names every blocking target before writing'] = static function () use ($base): void {
+	$app = fixture($base, 'environment-conflict');
+	put($app . '/public/environment.txt', "stale dev\n");
+	put($app . '/bin/tool', "local tool\n");
+
+	[$exit, $result] = command($app, ['install', '--environment=dev']);
+	$error = (string)($result['error'] ?? '');
+	check($exit === 4, 'An unrecognized environment-aware target did not conflict.');
+	check(str_contains($error, '- test/core public/environment.txt: unknown_existing'), 'Conflict message did not name the environment-aware target. ' . $error);
+	check(str_contains($error, '- test/core bin/tool: unknown_existing'), 'Conflict message omitted an ordinary blocking target. ' . $error);
+	check(str_contains($error, 'cannot be told apart'), 'Conflict message did not explain unknown_existing.');
+	$files = $result['packages'][0]['files'] ?? [];
+	check(array_column($files, 'target') === ['public/environment.txt', 'bin/tool'], 'JSON did not list exactly the blocking targets.');
+	check(array_unique(array_column($files, 'action')) === ['conflict'], 'JSON blocking targets lost their conflict action.');
+	check(!is_file($app . '/config/app.php') && !ScaffoldState::forAppRoot($app)->exists(), 'A blocked install wrote scaffold or state.');
+
+	[$exit, , $output] = command($app, ['install', '--environment=dev'], false);
+	check($exit === 4 && str_contains($output, 'public/environment.txt: unknown_existing'), 'Text output omitted the blocking target.');
+};
+
+$tests['install reports a local edit of an environment-aware target'] = static function () use ($base): void {
+	$app = fixture($base, 'environment-local-edit');
+	installed($app);
+	put($app . '/public/environment.txt', "edited\n");
+
+	[$exit, $result] = command($app, ['install', '--environment=dev']);
+	$error = (string)($result['error'] ?? '');
+	check($exit === 4 && str_contains($error, 'public/environment.txt: local_modified'), 'Local edit was not reported as local_modified. ' . $error);
+	check(!str_contains($error, 'different_environment'), 'Local edit was still reported as another environment.');
+	check(file_get_contents($app . '/public/environment.txt') === "edited\n", 'Blocked install overwrote a local edit.');
+};
+
+$tests['gitignore block follows every installed manifest'] = static function () use ($base): void {
+	$app = fixture($base, 'gitignore-block');
+	$runtime = ['/var/cache/*', '/var/backups/*', '/var/backups/flags/*', '!/var/cache/.gitkeep', '!/var/backups/flags/', '!/var/backups/flags/.gitkeep'];
+	package($app, 'test/runtime', [], [], $runtime);
+	$appRules = "# Application rules\n/node_modules/";
+	put($app . '/.gitignore', $appRules);
+
+	[$exit, $result, $output] = command($app, ['install', '--environment=dev']);
+	check($exit === 0, 'Install with a .gitignore failed. ' . $output);
+	check(($result['gitignore']['applied'] ?? null) === 'updated' && ($result['gitignore']['reason'] ?? null) === 'block_missing', 'Install did not insert the block.');
+	check(($result['gitignore']['newly_ignored'] ?? null) === ['bin/tool', 'public/environment.txt'], 'Newly ignored managed targets were not reported.');
+
+	$bytes = file_get_contents($app . '/.gitignore');
+	check(str_starts_with($bytes, GitignoreBlock::BEGIN . "\n"), 'The block was not inserted at the top.');
+	check(str_ends_with($bytes, GitignoreBlock::END . "\n\n" . $appRules), 'Application rules after the block changed.');
+	$order = ['/var/backups/*', '/var/backups/flags/*', '/var/cache/*', '!/var/backups/flags/', '!/var/backups/flags/.gitkeep', '!/var/cache/.gitkeep', '/bin/tool', '/public/environment.txt'];
+	$previous = -1;
+	foreach ($order as $line) {
+		$position = strpos($bytes, "\n" . $line . "\n");
+		check($position !== false && $position > $previous, 'Block line missing or out of order: ' . $line);
+		$previous = $position;
+	}
+	check(!str_contains($bytes, '/config/app.php'), 'A create-only target was ignored.');
+
+	[$exit, $status] = command($app, ['status']);
+	check($exit === 0 && ($status['gitignore']['status'] ?? null) === 'up_to_date', 'Status did not accept the fresh block.');
+	foreach ([['sync', '--package=test/core'], ['install', '--environment=dev', '--package=test/core']] as $scoped) {
+		[$exit, $result] = command($app, $scoped);
+		check($exit === 0 && ($result['gitignore']['applied'] ?? null) === 'skipped', 'A package-scoped run changed the block: ' . implode(' ', $scoped));
+		check(file_get_contents($app . '/.gitignore') === $bytes, 'A package-scoped run dropped rules of other packages.');
+	}
+
+	manifest($app, 'test/runtime', [], [...['/var/logs/*'], ...$runtime]);
+	[$exit, $status] = command($app, ['status', '--package=test/core']);
+	check($exit === 3 && ($status['gitignore']['reason'] ?? null) === 'block_drift', 'Status did not report a stale block.');
+	[$exit, $result] = command($app, ['sync', 'bin/tool']);
+	check($exit === 0 && array_key_exists('gitignore', $result) && $result['gitignore'] === null, 'A single-target sync planned the block.');
+	[$exit, $result] = command($app, ['sync', '--dry-run']);
+	check($exit === 0 && ($result['gitignore']['applied'] ?? null) === 'updated' && file_get_contents($app . '/.gitignore') === $bytes, 'Dry-run sync wrote the block.');
+	[$exit, $result] = command($app, ['sync']);
+	$updated = file_get_contents($app . '/.gitignore');
+	check($exit === 0 && str_contains($updated, "\n/var/logs/*\n") && ($result['gitignore']['newly_ignored'] ?? null) === [], 'Sync did not refresh the block.');
+	check(str_ends_with($updated, $appRules), 'Sync changed application rules.');
+
+	put($app . '/.gitignore', str_replace("\n/var/logs/*\n", "\n/var/logs/*\n/local-edit\n", $updated));
+	[$exit, $result] = command($app, ['sync']);
+	check($exit === 0 && file_get_contents($app . '/.gitignore') === $updated, 'Sync did not restore an edited block.');
+
+	put($app . '/.gitignore', $appRules);
+	[$exit, $result, $output] = command($app, ['migrate']);
+	check(($result['gitignore']['applied'] ?? null) === 'updated' && file_get_contents($app . '/.gitignore') === $updated, 'Migrate did not restore the block. ' . $output);
+};
+
+$tests['gitignore block keeps CRLF and follows other tool blocks'] = static function () use ($base): void {
+	$app = fixture($base, 'gitignore-crlf');
+	$devkit = "###> citomni/devkit ###\r\n/_*/\r\n###< citomni/devkit ###\r\n";
+	put($app . '/.gitignore', $devkit . "\r\n# Application rules\r\n/node_modules/\r\n");
+
+	[$exit, , $output] = command($app, ['install', '--environment=dev']);
+	check($exit === 0, 'Install with a CRLF .gitignore failed. ' . $output);
+	$bytes = file_get_contents($app . '/.gitignore');
+	check(substr_count($bytes, "\n") === substr_count($bytes, "\r\n"), 'The block did not keep CRLF line endings.');
+	check(str_starts_with($bytes, $devkit . "\r\n" . GitignoreBlock::BEGIN . "\r\n"), 'The block was not placed after the leading tool block.');
+	check(str_ends_with($bytes, GitignoreBlock::END . "\r\n\r\n# Application rules\r\n/node_modules/\r\n"), 'Application rules lost their position after the block.');
+	check(GitignoreBlock::remove($bytes) === $devkit . "\r\n# Application rules\r\n/node_modules/\r\n", 'Removing the block did not restore the original bytes.');
+};
+
+$tests['gitignore block helper round-trips and escapes literals'] = static function (): void {
+	$body = GitignoreBlock::body(['/var/cache/*', '/var/cache/*'], ['!/var/cache/.gitkeep'], ['odd[1]*?.txt', 'trail  ']);
+	check(in_array('/odd\\[1]\\*\\?.txt', $body, true) && in_array('/trail\\ \\ ', $body, true), 'Managed targets were not escaped as literals.');
+	check(count(array_keys($body, '/var/cache/*', true)) === 1, 'Duplicate rules were not removed.');
+	check(GitignoreBlock::body([], [], []) === [], 'An empty rule set produced a block.');
+
+	foreach (['', "/vendor/", "\n# app\n", "\xEF\xBB\xBF# app\n", "###> other/tool ###\n/x/\n###< other/tool ###\n# app\n"] as $original) {
+		$withBlock = GitignoreBlock::apply($original, $body);
+		check(GitignoreBlock::extract($withBlock) === $body, 'Extracted block differs from the applied body.');
+		check(GitignoreBlock::apply($withBlock, $body) === $withBlock, 'Applying the same block twice changed the file.');
+		check(GitignoreBlock::remove($withBlock) === $original, 'Removing the block did not restore: ' . json_encode($original));
+		check(GitignoreBlock::apply($withBlock, []) === $original, 'An empty body did not remove the block: ' . json_encode($original));
+	}
+	check(str_starts_with(GitignoreBlock::apply("\xEF\xBB\xBF# app\n", $body), "\xEF\xBB\xBF" . GitignoreBlock::BEGIN), 'The UTF-8 BOM did not stay first.');
+
+	foreach ([GitignoreBlock::BEGIN . "\n", GitignoreBlock::END . "\n" . GitignoreBlock::BEGIN . "\n", GitignoreBlock::BEGIN . "\n" . GitignoreBlock::BEGIN . "\n" . GitignoreBlock::END . "\n"] as $malformed) {
+		expectFailure(fn() => GitignoreBlock::apply($malformed, $body), 'Malformed block markers were accepted.');
+	}
+};
+
+$tests['gitignore manifest rules and reserved targets are validated'] = static function () use ($base): void {
+	$invalid = [
+		'not a list' => ['rule' => '/var/cache/*'],
+		'empty' => [''],
+		'control' => ["/var/cache/*\n"],
+		'whitespace' => [' /var/cache/*'],
+		'backslash' => ['var\\cache\\*'],
+		'comment' => ['# runtime'],
+		'ignore after exception' => ['!/var/cache/.gitkeep', '/var/cache/*'],
+		'wildcard exception' => ['/var/secrets/*', '!/var/secrets/*.tpl'],
+		'unanchored exception' => ['/var/cache/*', '!var/cache/.gitkeep'],
+		'unnormalized exception' => ['/var/cache/*', '!/var//cache/.gitkeep'],
+		'directory exception alone' => ['/var/backups/*', '!/var/backups/flags/'],
+		'directory exception without slash' => ['/var/backups/*', '/var/backups/flags/*', '!/var/backups/flags', '!/var/backups/flags/.gitkeep'],
+		'exception under ignored directory' => ['/data/', '!/data/keep.txt'],
+		'traversal' => ['/var/../secrets/*'],
+		'no path' => ['/'],
+	];
+	foreach ($invalid as $name => $rules) {
+		$app = fixture($base, 'gitignore-invalid-' . str_replace(' ', '-', $name));
+		package($app, 'test/runtime', [], [], $rules);
+		expectFailure(fn() => ScaffoldManifestLocator::forAppRoot($app)->discover(), 'Invalid gitignore rule was accepted: ' . $name);
+	}
+
+	$app = fixture($base, 'gitignore-valid');
+	package($app, 'test/runtime', [], [], ['/var/cache/*', '*.log', '/var/backups/flags/**', '!/var/cache/.gitkeep', '!/var/backups/flags/']);
+	$locator = ScaffoldManifestLocator::forAppRoot($app);
+	$rules = $locator->gitignoreRules($locator->discover());
+	check($rules['exceptions'] === ['!/var/cache/.gitkeep', '!/var/backups/flags/'], 'Valid exceptions were not collected.');
+	check($rules['targets'] === ['public/environment.txt', 'bin/tool'], 'Managed targets were not collected or create-only targets leaked in.');
+
+	$crossPackage = [
+		'exception beneath another package\'s ignored directory' => [['/data'], ['!/data/keep.txt']],
+		'directory kept without slash against a directory rule' => [['/var/secrets/'], ['!/var/secrets']],
+		'directory kept without slash against a content rule' => [['/var/secrets/*'], ['!/var/secrets']],
+		'directory kept without slash against a kept file' => [['/var/secrets/*', '!/var/secrets/keep.tpl'], ['!/var/secrets']],
+		'file kept against the identical ignore rule' => [['/var/secrets'], ['!/var/secrets']],
+	];
+	foreach ($crossPackage as $name => [$runtime, $keeper]) {
+		$app = fixture($base, 'gitignore-cross-' . substr(md5($name), 0, 8));
+		package($app, 'test/runtime', [], [], $runtime);
+		package($app, 'test/keeper', [], [], $keeper);
+		expectFailure(fn() => ScaffoldManifestLocator::forAppRoot($app)->discover(), 'Unsafe cross-package exception was accepted: ' . $name);
+	}
+
+	$app = fixture($base, 'gitignore-cross-directory-form');
+	package($app, 'test/runtime', [], [], ['/var/secrets/', '/var/cache/*', '!/var/cache/.gitkeep']);
+	package($app, 'test/keeper', [], [], ['/var/secrets/*', '!/var/secrets/', '!/var/secrets/keep.tpl', '!/var/cache/keeper.tpl']);
+	$locator = ScaffoldManifestLocator::forAppRoot($app);
+	$rules = $locator->gitignoreRules($locator->discover());
+	check(in_array('!/var/secrets/keep.tpl', $rules['exceptions'], true), 'A kept directory in directory form with its own content rule was rejected.');
+
+	$app = fixture($base, 'gitignore-reserved');
+	package($app, 'test/other', [['target' => '.gitignore', 'source' => 'install/other.stub', 'type' => 'text', 'policy' => 'managed']], ['install/other.stub' => 'other']);
+	expectFailure(fn() => ScaffoldManifestLocator::forAppRoot($app)->discover(), 'A package claimed .gitignore as a scaffold target.');
+	$app = fixture($base, 'gitignore-control-target');
+	package($app, 'test/other', [['target' => "bin/to\nol", 'source' => 'install/other.stub', 'type' => 'text', 'policy' => 'managed']], ['install/other.stub' => 'other']);
+	expectFailure(fn() => ScaffoldManifestLocator::forAppRoot($app)->discover(), 'A target with a control character was accepted.');
+};
+
+$tests['malformed gitignore markers stop install and migrate before writing'] = static function () use ($base): void {
+	$app = fixture($base, 'gitignore-malformed');
+	$malformed = GitignoreBlock::BEGIN . "\n/x\n" . GitignoreBlock::BEGIN . "\n" . GitignoreBlock::END . "\n";
+	put($app . '/.gitignore', $malformed);
+
+	[$exit, $status] = command($app, ['status', '--environment=dev']);
+	check($exit === 4 && ($status['gitignore']['status'] ?? null) === 'malformed', 'Status did not report malformed markers as a conflict.');
+	[$exit, $result] = command($app, ['install', '--environment=dev']);
+	check($exit === 4 && ($result['gitignore']['status'] ?? null) === 'malformed' && ($result['gitignore']['action'] ?? null) === 'conflict', 'Install accepted malformed markers.');
+	check(str_starts_with((string)($result['error'] ?? ''), 'Install stopped before writing: '), 'Install did not explain the malformed markers.');
+	check(!is_file($app . '/bin/tool') && !ScaffoldState::forAppRoot($app)->exists(), 'Install wrote scaffold or state despite malformed markers.');
+	check(file_get_contents($app . '/.gitignore') === $malformed, 'Malformed markers were rewritten.');
+
+	put($app . '/.gitignore', "# Application rules\n");
+	[$exit, , $output] = command($app, ['install', '--environment=dev']);
+	check($exit === 0, 'Install did not recover after the markers were repaired. ' . $output);
+
+	put($app . '/.gitignore', GitignoreBlock::END . "\n" . file_get_contents($app . '/.gitignore'));
+	[$exit, $result] = command($app, ['migrate', '--environment=prod']);
+	check($exit === 4 && ($result['gitignore']['status'] ?? null) === 'malformed', 'Migrate accepted malformed markers.');
+	check(file_get_contents($app . '/public/environment.txt') === "dev\n", 'Migrate switched files despite malformed markers.');
+	check(ScaffoldState::forAppRoot($app)->environment() === Environment::DEV, 'Migrate changed the recorded environment despite malformed markers.');
+};
+
+$tests['near-miss gitignore markers are recognized or rejected, never duplicated'] = static function () use ($base): void {
+	$app = fixture($base, 'gitignore-near-miss');
+	installed($app);
+	put($app . '/.gitignore', GitignoreBlock::BEGIN . " \t\n/stale\n" . GitignoreBlock::END . "  \n\n# Application rules\n");
+	[$exit, $result] = command($app, ['sync']);
+	$bytes = file_get_contents($app . '/.gitignore');
+	check($exit === 0 && ($result['gitignore']['reason'] ?? null) === 'block_drift', 'Markers with trailing whitespace were not recognized.');
+	check(substr_count($bytes, GitignoreBlock::BEGIN) === 1 && !str_contains($bytes, '/stale'), 'A second block was inserted next to the old one.');
+	check(str_ends_with($bytes, GitignoreBlock::END . "\n\n# Application rules\n"), 'The rewritten markers kept trailing whitespace or moved app rules.');
+
+	put($app . '/.gitignore', GitignoreBlock::BEGIN . " extra\n" . GitignoreBlock::END . "\n");
+	[$exit, $status] = command($app, ['status']);
+	check($exit === 4 && ($status['gitignore']['status'] ?? null) === 'malformed', 'A garbled marker line was not reported as malformed.');
+
+	$otherTool = "###> citomni/installer-extras ###\n/x/\n###< citomni/installer-extras ###\n";
+	put($app . '/.gitignore', $otherTool);
+	[$exit] = command($app, ['sync']);
+	check($exit === 0 && str_starts_with(file_get_contents($app . '/.gitignore'), $otherTool . GitignoreBlock::BEGIN), 'A similarly named tool block was mistaken for the installer block.');
+};
+
+$tests['unsupported gitignore files never break commands'] = static function () use ($base): void {
+	$app = fixture($base, 'gitignore-unsupported');
+	$outside = $base . '/shared-gitignore';
+	put($outside, "/shared/\n");
+	if (!@symlink($outside, $app . '/.gitignore')) {
+		echo "  SKIP Unsupported .gitignore check (symlink creation unavailable).\n";
+		return;
+	}
+
+	[$exit, $result, $output] = command($app, ['install', '--environment=dev']);
+	check($exit === 0 && ($result['gitignore']['status'] ?? null) === 'unsupported' && ($result['gitignore']['reason'] ?? null) === 'gitignore_symlink', 'A .gitignore outside the application broke install. ' . $output);
+	foreach ([['status'], ['doctor'], ['repair'], ['sync'], ['environment', 'prod'], ['environment', 'dev']] as $args) {
+		[$exit, , $output] = command($app, $args);
+		check($exit === 0, 'A .gitignore outside the application broke ' . implode(' ', $args) . '. ' . $output);
+	}
+	check(file_get_contents($outside) === "/shared/\n", 'The installer wrote through a symlink leaving the application.');
+
+	unlink($app . '/.gitignore');
+	symlink($base . '/missing-gitignore', $app . '/.gitignore');
+	[$exit, $status] = command($app, ['status']);
+	check($exit === 0 && ($status['gitignore']['status'] ?? null) === 'unsupported', 'A dangling .gitignore symlink broke status.');
+	unlink($app . '/.gitignore');
+	put($app . '/config/gitignore', "# Application rules\n");
+	symlink('config/gitignore', $app . '/.gitignore');
+	[$exit, $status] = command($app, ['status']);
+	check($exit === 0 && ($status['gitignore']['reason'] ?? null) === 'gitignore_symlink', 'A symlinked .gitignore inside the application was not reported as unsupported.');
+	[$exit, $result] = command($app, ['sync']);
+	check($exit === 0 && ($result['gitignore']['applied'] ?? null) === 'skipped', 'Sync planned a block behind a symlinked .gitignore.');
+	check(file_get_contents($app . '/config/gitignore') === "# Application rules\n", 'Sync wrote a block that Git would never read.');
+
+	unlink($app . '/.gitignore');
+	mkdir($app . '/.gitignore');
+	[$exit, $status] = command($app, ['status']);
+	check($exit === 0 && ($status['gitignore']['reason'] ?? null) === 'gitignore_not_regular_file', 'A .gitignore directory was not reported as unsupported.');
+};
+
+$tests['no scaffold manifests means no gitignore block'] = static function () use ($base): void {
+	$app = $base . '/apps/gitignore-no-manifests';
+	put($app . '/composer.json', json_encode(['name' => 'test/app', 'config' => ['classmap-authoritative' => false]]));
+	put($app . '/vendor/composer/installed.json', json_encode(['packages' => []]));
+	put($app . '/.gitignore', GitignoreBlock::BEGIN . "\n/orphan\n" . GitignoreBlock::END . "\n");
+	[$exit, $status] = command($app, ['status']);
+	check($exit === 0 && array_key_exists('gitignore', $status) && $status['gitignore'] === null, 'Status reported a block that no command can maintain.');
+	[$exit, $result] = command($app, ['sync']);
+	check($exit === 0 && array_key_exists('gitignore', $result) && $result['gitignore'] === null, 'The empty sync result lost its gitignore key.');
+	[$exit, $result] = command($app, ['install']);
+	check($exit === 2 && array_key_exists('gitignore', $result) && $result['gitignore'] === null, 'A usage failure lost its gitignore key.');
+};
+
+$tests['app-skeleton audit ignores the installer block and keeps it in the reference'] = static function () use ($base): void {
+	$app = $base . '/apps/app-skeleton-installer-block';
+	mkdir($app, 0775, true);
+	$body = GitignoreBlock::body(['/var/cache/*'], [], ['public/index.php']);
+	put($app . '/.gitignore', GitignoreBlock::apply("vendor\nvar/cache\n", $body));
+	$audit = new AuditAppSkeletonMigration(new PathGuard($app));
+
+	$identical = $audit->apply(['sha' => str_repeat('a', 40), 'files' => ['.gitignore' => ['url' => 'https://example.invalid/.gitignore', 'bytes' => "vendor\nvar/cache\n"]]], false);
+	check(($identical['files'][0]['status'] ?? null) === 'identical' && !is_file($app . '/.gitignore.new'), 'The installer block counted as app-skeleton drift.');
+
+	$different = $audit->apply(['sha' => str_repeat('a', 40), 'files' => ['.gitignore' => ['url' => 'https://example.invalid/.gitignore', 'bytes' => "vendor\nvar/logs\n"]]], false);
+	check(($different['files'][0]['status'] ?? null) === 'different', 'Real app-skeleton drift was hidden.');
+	check(!str_contains((string)$different['files'][0]['diff'], GitignoreBlock::BEGIN), 'The diff included the installer block.');
+	check(file_get_contents($app . '/.gitignore.new') === GitignoreBlock::apply("vendor\nvar/logs\n", $body), 'The reference sidecar lost the installer block.');
 };
 
 

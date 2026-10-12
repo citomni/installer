@@ -18,8 +18,10 @@ use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\ScaffoldRenderer;
 use CitOmni\Installer\State\ScaffoldState;
 use CitOmni\Installer\Util\Checksum;
+use CitOmni\Installer\Util\GitignoreBlock;
 use CitOmni\Installer\Util\Path;
 use CitOmni\Installer\Util\PhpSourceComparator;
+use CitOmni\Installer\Exception\ConflictException;
 use CitOmni\Installer\Exception\InstallerException;
 use CitOmni\Installer\Exception\FilesystemException;
 
@@ -40,6 +42,8 @@ use CitOmni\Installer\Exception\FilesystemException;
  * - Drift is split into `update_available` (reason `stub_drift`) vs
  *   `placeholder_drift`, exactly as §7 prescribes, but only while disk still
  *   matches the prior baseline (clean).
+ * - With the `gitignore` option it also plans the installer block in the app's
+ *   .gitignore from the complete installed rule set (see planGitignore()).
  *
  * Return shape (arrays only):
  *   [
@@ -57,17 +61,27 @@ use CitOmni\Installer\Exception\FilesystemException;
  *             'reason' => 'rendered_checksum_mismatch',
  *             'action' => 'write_new',
  *             'backup' => true,                 // present ONLY when a forced overwrite backs up first
+ *             '_environment_aware' => true,     // INTERNAL: present ONLY for environment-aware targets
  *             '_apply' => [ ... ]               // INTERNAL: consumed by ApplyScaffoldPlan, NOT for DevKit JSON
  *           ],
  *         ],
  *       ],
+ *     ],
+ *     'gitignore' => [                         // present ONLY with the `gitignore` option
+ *       'target' => '.gitignore',
+ *       'status' => 'update_available',
+ *       'reason' => 'block_missing',
+ *       'action' => 'update',
+ *       'newly_ignored' => ['public/index.php'],
+ *       '_apply' => [ ... ],
  *     ],
  *   ]
  *
  * Notes:
  * - The DevKit-stable JSON object (§11) is the public subset of each file entry
  *   (target/type/policy/status/reason/action[/backup]). Any underscore-prefixed
- *   key (`_apply`) is internal and MUST be stripped by the JSON formatter.
+ *   key (`_apply`, `_environment_aware`) is internal and MUST be stripped by the
+ *   JSON formatter.
  * - Integrity failures (unsafe path, source missing, unsafe state) FAIL FAST as
  *   InstallerException rather than emitting a per-file `error`/`fail`. The
  *   `error`/`fail` closed-set members are reserved for graceful multi-file
@@ -105,7 +119,10 @@ final class BuildScaffoldPlan {
 	 * @param  array<string,mixed>               $options       ['force'=>bool, 'target'=>?string single-file scope,
 	 *                                                           'environment_materialization'=>bool,
 	 *                                                           'migration_reconcile'=>bool,
-	 *                                                           'migration_environment_changed'=>bool].
+	 *                                                           'migration_environment_changed'=>bool,
+	 *                                                           'gitignore'=>array{ignore:list<string>,exceptions:list<string>,targets:list<string>}
+	 *                                                           block input for ALL installed packages, from
+	 *                                                           ScaffoldManifestLocator::gitignoreRules()].
 	 * @return array<string,mixed>               The plan (arrays only).
 	 * @throws InstallerException  On unknown command, unsafe path, missing source, or unsafe state.
 	 */
@@ -169,7 +186,12 @@ final class BuildScaffoldPlan {
 			];
 		}
 
-		return ['command' => $command, 'force' => $force, 'packages' => $packages];
+		$plan = ['command' => $command, 'force' => $force, 'packages' => $packages];
+		if (\is_array($options['gitignore'] ?? null)) {
+			$plan['gitignore'] = $this->planGitignore($command, $options['gitignore']);
+		}
+
+		return $plan;
 	}
 
 
@@ -312,6 +334,9 @@ final class BuildScaffoldPlan {
 		];
 		if (!empty($decision['backup'])) {
 			$entry['backup'] = true;
+		}
+		if ($environmentAware) {
+			$entry['_environment_aware'] = true;
 		}
 		if (!empty($decision['apply'])) {
 			$entry['_apply'] = $decision['apply'];
@@ -598,9 +623,19 @@ final class BuildScaffoldPlan {
 	/**
 	 * Initial environment materialization compatibility gate.
 	 *
-	 * Existing environment-aware targets may be adopted only when their current
-	 * bytes already equal the desired rendering. A different environment is a
-	 * conflict even when --force was supplied; switching belongs to `environment`.
+	 * Behavior:
+	 * - Missing targets are created.
+	 * - A clean recorded baseline with drift (`update_available`, `placeholder_drift`)
+	 *   is left for sync, exactly as decideInstall() does. InstallCommand rejects a
+	 *   different recorded environment before planning, so such a baseline belongs to
+	 *   the requested environment at an older package revision.
+	 * - Other existing targets are adopted only when their bytes already equal the
+	 *   desired rendering. Otherwise they conflict with their status as the reason:
+	 *   without a matching baseline the installer cannot tell another environment, an
+	 *   older package revision and a local edit apart.
+	 *
+	 * Notes:
+	 * - --force never applies here; switching environments belongs to `environment`.
 	 *
 	 * @param array<string,mixed> $ctx
 	 * @return array<string,mixed>
@@ -610,13 +645,17 @@ final class BuildScaffoldPlan {
 			return $this->createWith($ctx, $ctx['pkgPlaceholders']);
 		}
 
+		if ($status === 'update_available' || $status === 'placeholder_drift') {
+			return ['action' => 'none'];
+		}
+
 		$ck = $ctx['currentCk'] ?? $this->render($ctx['sourceAbs'], $ctx['pkgPlaceholders']);
 		$disk = (string)$ctx['disk'];
 
 		if (!Checksum::matches($disk, $ck[1])) {
 			return [
 				'action' => 'conflict',
-				'reason' => 'different_environment',
+				'reason' => $status,
 			];
 		}
 
@@ -773,6 +812,114 @@ final class BuildScaffoldPlan {
 			: 'recreated_from_recorded';
 
 		return ['action' => 'create', 'reason' => $reason, 'apply' => $this->applyState($ctx, $recorded, $ck)];
+	}
+
+
+	// ----------------------------------------------------------------
+	// .gitignore block
+	// ----------------------------------------------------------------
+
+	/**
+	 * Plan the installer-owned block in the application's .gitignore.
+	 *
+	 * Behavior:
+	 * - A missing .gitignore is never created; the block is reported as `absent`.
+	 * - A .gitignore the installer cannot maintain is reported as `unsupported` and left
+	 *   alone; it never fails the command. That covers a symlink, which Git does not read
+	 *   from the working tree, a path PathGuard rejects, a non-regular file, and
+	 *   unreadable bytes.
+	 * - The block is generated from the manifests, so any difference is an update
+	 *   without backup and without state. Git history keeps the previous bytes.
+	 * - Malformed markers are a conflict for write commands and only a report for status.
+	 * - `newly_ignored` lists managed targets the current block does not ignore yet.
+	 *   Files that Git already tracks stay tracked until they are untracked.
+	 *
+	 * @param string $command Planner command.
+	 * @param array<string,mixed> $rules Output of ScaffoldManifestLocator::gitignoreRules().
+	 * @return array<string,mixed> Block entry; `_apply` is present only for an update.
+	 * @throws InstallerException When a managed target cannot be expressed as a .gitignore line.
+	 */
+	private function planGitignore(string $command, array $rules): array {
+		$targets = \array_map('strval', (array)($rules['targets'] ?? []));
+		$body = GitignoreBlock::body((array)($rules['ignore'] ?? []), (array)($rules['exceptions'] ?? []), $targets);
+		$entry = ['target' => GitignoreBlock::FILE];
+		$unsupported = static fn(string $reason, string $error): array => $entry + [
+			'status' => 'unsupported',
+			'reason' => $reason,
+			'action' => 'none',
+			'newly_ignored' => [],
+			'error' => $error,
+		];
+
+		// Git opens .gitignore without following symlinks, so a block behind one has no effect.
+		$link = $this->pathGuard->appRoot() . '/' . GitignoreBlock::FILE;
+		\clearstatcache(true, $link);
+		if (\is_link($link)) {
+			return $unsupported('gitignore_symlink', GitignoreBlock::FILE . ' is a symlink, and Git does not read a symlinked .gitignore from the working tree.');
+		}
+
+		try {
+			$path = $this->pathGuard->resolveTarget(GitignoreBlock::FILE);
+		} catch (InstallerException $e) {
+			return $unsupported('gitignore_unsafe_path', $e->getMessage());
+		}
+
+		\clearstatcache(true, $path);
+		if (\file_exists($path) && !\is_file($path)) {
+			return $unsupported('gitignore_not_regular_file', 'Not a regular file: ' . GitignoreBlock::FILE);
+		}
+		if (!\is_file($path)) {
+			return $entry + ['status' => 'absent', 'reason' => 'gitignore_missing', 'action' => 'none', 'newly_ignored' => []];
+		}
+
+		$bytes = @\file_get_contents($path);
+		if ($bytes === false) {
+			return $unsupported('gitignore_unreadable', 'Cannot read ' . GitignoreBlock::FILE . '.');
+		}
+
+		try {
+			$current = GitignoreBlock::extract($bytes);
+			$updated = GitignoreBlock::apply($bytes, $body);
+		} catch (ConflictException $e) {
+			return $entry + [
+				'status' => 'malformed',
+				'reason' => 'block_malformed',
+				'action' => $command === 'status' ? 'none' : 'conflict',
+				'newly_ignored' => [],
+				'error' => $e->getMessage(),
+			];
+		}
+
+		if ($updated === $bytes) {
+			return $entry + ['status' => 'up_to_date', 'reason' => 'matches_manifests', 'action' => 'none', 'newly_ignored' => []];
+		}
+
+		$newlyIgnored = [];
+		foreach ($targets as $target) {
+			if ($current === null || !\in_array(GitignoreBlock::literal($target), $current, true)) {
+				$newlyIgnored[] = $target;
+			}
+		}
+		$newlyIgnored = \array_values(\array_unique($newlyIgnored));
+		\sort($newlyIgnored, \SORT_STRING);
+
+		$entry += [
+			'status' => 'update_available',
+			'reason' => $current === null ? 'block_missing' : ($body === [] ? 'block_obsolete' : 'block_drift'),
+			'action' => $command === 'status' ? 'none' : 'update',
+			'newly_ignored' => $newlyIgnored,
+		];
+		if ($entry['action'] === 'update') {
+			$entry['_apply'] = [
+				'target' => GitignoreBlock::FILE,
+				'target_abs' => $path,
+				'target_exists' => true,
+				'target_checksum' => Checksum::sha256($bytes),
+				'body' => $body,
+			];
+		}
+
+		return $entry;
 	}
 
 

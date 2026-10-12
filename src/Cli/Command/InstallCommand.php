@@ -30,10 +30,16 @@ use CitOmni\Installer\Support\InstallerLock;
 /**
  * `install` — initial scaffold and environment materialization.
  *
- * Install is intentionally not an environment switch interface. Environment-aware
- * targets that already exist must match the requested environment exactly before any
- * write can occur. Existing content from another environment is routed to the
- * dedicated `environment <env>` command instead of being overwritten by --force.
+ * Install is intentionally not an environment switch interface. An existing
+ * environment-aware target must match the requested rendering, or keep a clean recorded
+ * baseline of the same environment that sync updates later, before any write can occur.
+ * Otherwise install stops without writing and names every conflicting target. Content
+ * from another environment is routed to the dedicated `environment <env>` command
+ * instead of being overwritten by --force.
+ *
+ * Install also maintains the installer block in an existing .gitignore, planned from
+ * every installed package even when --package narrows the scaffold files. Malformed
+ * block markers stop install before writing, like an environment conflict.
  */
 final class InstallCommand extends AbstractWriteCommand {
 
@@ -109,7 +115,7 @@ final class InstallCommand extends AbstractWriteCommand {
 		}
 
 		try {
-			$manifests = $this->resolveManifests($opt['package']);
+			[$discovered, $manifests] = $this->resolveManifests($opt['package']);
 		} catch (InstallerException $e) {
 			return $this->fail($format, $e->getMessage(), $this->exceptionExitCode($e));
 		}
@@ -125,6 +131,7 @@ final class InstallCommand extends AbstractWriteCommand {
 			$plan = $this->builder->build('install', $manifests, $placeholders, [
 				'force' => $opt['force'],
 				'environment_materialization' => true,
+				'gitignore' => $this->locator->gitignoreRules($discovered),
 			]);
 		} catch (InstallerException $e) {
 			return $this->fail(
@@ -134,16 +141,18 @@ final class InstallCommand extends AbstractWriteCommand {
 			);
 		}
 
-		if ($this->hasDifferentEnvironmentConflict($plan)) {
+		if ($this->hasEnvironmentConflict($plan)) {
 			return $this->fail(
 				$format,
-				\sprintf(
-					'An existing environment-aware target does not match %s. No scaffold files were written. Use `citomni-installer environment %s` to switch it authoritatively.',
-					$environment->value,
-					$environment->value
-				),
-				ExitCode::CONFLICT->value
+				$this->environmentConflictMessage($plan, $environment),
+				ExitCode::CONFLICT->value,
+				$this->conflictPackages($plan)
 			);
+		}
+
+		$gitignoreExit = $this->failOnGitignoreConflict($plan, $format);
+		if ($gitignoreExit !== null) {
+			return $gitignoreExit;
 		}
 
 		$confirmExit = $this->confirmForcedPlanIfNeeded($plan, $format, $opt);
@@ -202,17 +211,59 @@ final class InstallCommand extends AbstractWriteCommand {
 	 * Detect the install-only pre-write environment compatibility conflict.
 	 *
 	 * @param array<string,mixed> $plan Install plan.
-	 * @return bool
+	 * @return bool True when an environment-aware target conflicts.
 	 */
-	private function hasDifferentEnvironmentConflict(array $plan): bool {
+	private function hasEnvironmentConflict(array $plan): bool {
 		foreach ((array)($plan['packages'] ?? []) as $package) {
 			foreach ((array)($package['files'] ?? []) as $file) {
-				if (($file['action'] ?? null) === 'conflict' && ($file['reason'] ?? null) === 'different_environment') {
+				if (($file['action'] ?? null) === 'conflict' && !empty($file['_environment_aware'])) {
 					return true;
 				}
 			}
 		}
 
 		return false;
+	}
+
+
+	/**
+	 * Explain a pre-write environment conflict with every blocking target.
+	 *
+	 * Behavior:
+	 * - Lists each conflicting target as "package target: reason", including ordinary
+	 *   managed targets that would also block this install.
+	 * - Adds one explanation per reason that occurs.
+	 *
+	 * @param array<string,mixed> $plan Install plan.
+	 * @param Environment $environment Requested environment.
+	 * @return string Message for text and JSON output.
+	 */
+	private function environmentConflictMessage(array $plan, Environment $environment): string {
+		$lines = [\sprintf(
+			'Install stopped before writing: existing environment-aware scaffold targets do not match the %s rendering.',
+			$environment->value
+		)];
+		$reasons = [];
+		foreach ($this->conflictPackages($plan) as $package) {
+			foreach ($package['files'] as $file) {
+				$lines[] = \sprintf('- %s %s: %s', $package['name'], $file['target'], $file['reason']);
+				$reasons[$file['reason']] = true;
+			}
+		}
+
+		if (isset($reasons['unknown_existing'])) {
+			$lines[] = \sprintf(
+				'unknown_existing: no recorded baseline exists, so another environment, an older package revision and a local edit cannot be told apart. Delete a stale package-managed file so install can recreate it; to adopt files from another environment, install that environment first and then run `citomni-installer environment %s`.',
+				$environment->value
+			);
+		}
+		if (isset($reasons['local_modified'])) {
+			$lines[] = \sprintf(
+				'local_modified: the file differs from its recorded baseline. `citomni-installer sync` writes the current rendering as .new for review; `citomni-installer environment %s` replaces environment-aware targets after a backup.',
+				$environment->value
+			);
+		}
+
+		return \implode("\n", $lines);
 	}
 }

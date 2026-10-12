@@ -15,9 +15,11 @@ declare(strict_types=1);
 
 namespace CitOmni\Installer\Operation;
 
+use CitOmni\Installer\Exception\ConflictException;
 use CitOmni\Installer\Exception\FilesystemException;
 use CitOmni\Installer\Support\AtomicFileWriter;
 use CitOmni\Installer\Support\PathGuard;
+use CitOmni\Installer\Util\GitignoreBlock;
 use CitOmni\Installer\Util\UnifiedDiff;
 
 /**
@@ -26,6 +28,9 @@ use CitOmni\Installer\Util\UnifiedDiff;
  * Behavior:
  * - .gitignore, .gitattributes, and composer.json are text-compared after normalizing
  *   line endings and ignoring one final newline difference.
+ * - The installer block in .gitignore is generated per application, so it is left out
+ *   of the comparison and carried into the `.gitignore.new` reference. Malformed block
+ *   markers fall back to a plain comparison; the scaffold plan reports them.
  * - composer.json remains advisory because real apps are expected to diverge and the
  *   installer manages classmap-authoritative by environment.
  * - A differing or missing app-owned file is never replaced. The reference is written
@@ -75,8 +80,11 @@ final class AuditAppSkeletonMigration {
 				}
 			}
 
-			$currentComparable = $this->normalizeTextForComparison($current);
-			$desiredComparable = $this->normalizeTextForComparison($desired);
+			[$currentText, $desiredText, $desired] = $target === GitignoreBlock::FILE
+				? $this->withoutInstallerBlock($current, $desired)
+				: [$current, $desired, $desired];
+			$currentComparable = $this->normalizeTextForComparison($currentText);
+			$desiredComparable = $this->normalizeTextForComparison($desiredText);
 
 			if ($exists && $currentComparable === $desiredComparable) {
 				$resultFiles[] = [
@@ -117,6 +125,28 @@ final class AuditAppSkeletonMigration {
 			'files' => $resultFiles,
 			'manual_review' => $manual,
 		];
+	}
+
+
+	/**
+	 * Remove the installer block from both .gitignore texts and carry it into the reference.
+	 *
+	 * @param string $current Current application bytes ('' when missing).
+	 * @param string $desired Reference bytes.
+	 * @return array{0:string,1:string,2:string} [current text to compare, reference text to compare, sidecar bytes].
+	 */
+	private function withoutInstallerBlock(string $current, string $desired): array {
+		try {
+			$block = GitignoreBlock::extract($current);
+			$reference = GitignoreBlock::remove($desired);
+			return [
+				GitignoreBlock::remove($current),
+				$reference,
+				$block === null ? $desired : GitignoreBlock::apply($reference, $block),
+			];
+		} catch (ConflictException) {
+			return [$current, $desired, $desired];
+		}
 	}
 
 

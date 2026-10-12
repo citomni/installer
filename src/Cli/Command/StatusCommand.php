@@ -30,7 +30,8 @@ use CitOmni\Installer\Support\ScaffoldManifestLocator;
  * An explicit --environment wins over recorded state and acts as a preview. When
  * environment-aware manifests exist and neither source provides an environment,
  * status fails rather than guessing. Composer posture is inspected directly from
- * composer.json and never requires the Composer executable.
+ * composer.json and never requires the Composer executable. The installer block in
+ * .gitignore is always compared with every installed package, also with --package.
  */
 final class StatusCommand {
 
@@ -58,7 +59,7 @@ final class StatusCommand {
 		$format = $opt['format'];
 
 		try {
-			$manifests = $this->resolveManifests($opt['package']);
+			[$discovered, $manifests] = $this->resolveManifests($opt['package']);
 		} catch (InstallerException $e) {
 			return $this->fail($format, $e->getMessage(), ExitCode::GENERAL_ERROR->value);
 		}
@@ -103,7 +104,10 @@ final class StatusCommand {
 			foreach (\array_keys($manifests) as $pkgName) {
 				$placeholders[$pkgName] = $resolved;
 			}
-			$plan = $this->builder->build('status', $manifests, $placeholders);
+			// Without any scaffold manifest the installer maintains nothing, not even the block.
+			$plan = $this->builder->build('status', $manifests, $placeholders, $discovered === [] ? [] : [
+				'gitignore' => $this->locator->gitignoreRules($discovered),
+			]);
 		} catch (InstallerException $e) {
 			return $this->fail(
 				$format,
@@ -137,15 +141,18 @@ final class StatusCommand {
 
 
 	/**
-	 * @return array<string,array<string,mixed>> Manifests keyed by package name.
+	 * Discover every scaffold manifest once and select the requested package.
+	 *
+	 * @return array{0:array<string,array<string,mixed>>,1:array<string,array<string,mixed>>}
+	 *         [all discovered manifests, manifests selected by --package].
 	 */
 	private function resolveManifests(?string $package): array {
+		$discovered = $this->locator->discover();
 		if ($package === null) {
-			return $this->locator->discover();
+			return [$discovered, $discovered];
 		}
 
-		$one = $this->locator->discoverPackage($package);
-		return $one === null ? [] : [$package => $one];
+		return [$discovered, isset($discovered[$package]) ? [$package => $discovered[$package]] : []];
 	}
 
 
@@ -185,19 +192,26 @@ final class StatusCommand {
 	/**
 	 * Derive scaffold exit code from plan statuses.
 	 *
+	 * The .gitignore block counts like a file: a stale block is drift, malformed
+	 * markers are a conflict, and a missing or unsupported .gitignore is not a finding.
+	 *
 	 * @param array<string,mixed> $plan Status plan.
 	 * @return int
 	 */
 	private function exitCodeFor(array $plan): int {
 		$worst = ExitCode::OK->value;
 		$anyError = false;
+		$packages = (array)($plan['packages'] ?? []);
+		if (\is_array($plan['gitignore'] ?? null)) {
+			$packages[] = ['files' => [$plan['gitignore']]];
+		}
 
-		foreach ((array)($plan['packages'] ?? []) as $pkg) {
+		foreach ($packages as $pkg) {
 			foreach ((array)($pkg['files'] ?? []) as $file) {
 				$code = match ((string)($file['status'] ?? '')) {
-					'local_modified', 'unknown_existing' => ExitCode::CONFLICT->value,
+					'local_modified', 'unknown_existing', 'malformed' => ExitCode::CONFLICT->value,
 					'missing', 'update_available', 'placeholder_drift' => ExitCode::DRIFT->value,
-					'up_to_date', 'create_only_present' => ExitCode::OK->value,
+					'up_to_date', 'create_only_present', 'absent', 'unsupported' => ExitCode::OK->value,
 					default => -1,
 				};
 
@@ -245,6 +259,17 @@ final class StatusCommand {
 			);
 		}
 
+		$gitignore = \is_array($plan['gitignore'] ?? null) ? $plan['gitignore'] : null;
+		if ($gitignore !== null) {
+			$out .= \sprintf(".gitignore block: %s (%s)\n", (string)($gitignore['status'] ?? ''), (string)($gitignore['reason'] ?? ''));
+			if (isset($gitignore['error'])) {
+				$out .= '  error: ' . (string)$gitignore['error'] . "\n";
+			}
+			foreach ((array)($gitignore['newly_ignored'] ?? []) as $target) {
+				$out .= '  would ignore: ' . (string)$target . "\n";
+			}
+		}
+
 		$out .= \sprintf("\nResult: %s (exit %d)\n", $this->summaryLabel($exit), $exit);
 		\fwrite(\STDOUT, $out);
 	}
@@ -271,12 +296,25 @@ final class StatusCommand {
 			$packages[] = ['name' => (string)($pkg['name'] ?? ''), 'files' => $files];
 		}
 
+		$gitignore = null;
+		if (\is_array($plan['gitignore'] ?? null)) {
+			$block = $plan['gitignore'];
+			$gitignore = [
+				'target' => (string)($block['target'] ?? ''),
+				'status' => (string)($block['status'] ?? ''),
+				'reason' => (string)($block['reason'] ?? ''),
+				'newly_ignored' => \array_values(\array_map('strval', (array)($block['newly_ignored'] ?? []))),
+				'error' => isset($block['error']) ? (string)$block['error'] : null,
+			];
+		}
+
 		\fwrite(\STDOUT, InstallerCli::encodeJson([
 			'ok' => $exit === ExitCode::OK->value,
 			'exit_code' => $exit,
 			'environment' => $environment?->value,
 			'composer' => $composer,
 			'packages' => $packages,
+			'gitignore' => $gitignore,
 		]) . "\n");
 	}
 
@@ -298,6 +336,7 @@ final class StatusCommand {
 				'exit_code' => $exit,
 				'error' => $message,
 				'packages' => [],
+				'gitignore' => null,
 			]) . "\n");
 		} else {
 			\fwrite(\STDERR, $message . "\n");

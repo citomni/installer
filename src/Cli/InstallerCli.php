@@ -370,6 +370,9 @@ Usage:
 
 Reports per file: missing, up_to_date, update_available (stub drift),
 placeholder_drift, local_modified, unknown_existing, create_only_present.
+Also compares the citomni/installer block in .gitignore with every installed
+package: up_to_date, update_available, malformed, absent (no .gitignore), or
+unsupported (for example a symlinked .gitignore, which Git does not read).
 
 Placeholder values are resolved from config/citomni_installer.php and then
 overridden by any --placeholder options. Drift detection renders managed stubs,
@@ -391,11 +394,15 @@ Usage:
 Performs initial scaffold materialization for the selected environment, applies
 CitOmni's Composer classmap-authoritative posture, dumps autoload with --no-scripts,
 and commits v2 installer state only after all materialization succeeds. Existing
-environment-aware files must already match the requested environment; use the
-environment command to switch them. --force applies only to ordinary scaffold
-conflicts and never acts as an environment switch. Initial materialization requires
-all packages; --package is available only after an environment is recorded.
-Use --dry-run to preview.
+environment-aware files must already match the requested rendering; a clean recorded
+baseline that only lags behind its package is left to sync. Any other difference
+stops install before writing and names every blocking target. Use the environment
+command to switch environments. --force applies only to ordinary scaffold conflicts
+and never acts as an environment switch. Initial materialization requires all
+packages; --package is available only after an environment is recorded. Install
+also writes the citomni/installer block in an existing .gitignore from every
+installed package; malformed block markers stop it before writing. Use --dry-run
+to preview.
 
 Exit codes:
   0  applied / nothing to do   4  conflicts (existing files in the way)
@@ -421,7 +428,8 @@ current templates. The command also audits installer placeholders, reports advis
 percent-style uppercase tokens found in current package scaffold sources, compares root
 references with one pinned current citomni/app-skeleton commit while ignoring line-ending
 and one final-newline difference, recursively runs
-`php -l` on app-owned `.php` and `.php.tpl` files, and writes a Markdown report under
+`php -l` on app-owned `.php` and `.php.tpl` files, refreshes the citomni/installer
+block in an existing .gitignore, and writes a Markdown report under
 var/logs/citomni-installer/migrations/ after real runs.
 
 Exit codes:
@@ -439,9 +447,10 @@ Usage:
 
 Switches only environment-aware scaffold targets. Desired environment bytes are
 authoritative: differing existing files are backed up and atomically replaced.
-Environment-agnostic scaffold is untouched. Composer classmap-authoritative is
-then set for the target environment and dump-autoload --no-scripts is run before
-one final state commit. --force and --package are intentionally unsupported.
+Environment-agnostic scaffold and .gitignore are untouched. Composer
+classmap-authoritative is then set for the target environment and dump-autoload
+--no-scripts is run before one final state commit. --force and --package are
+intentionally unsupported.
 
 Exit codes:
   0  applied / nothing to do   1  error                  2  invalid usage
@@ -477,8 +486,9 @@ stub/placeholders, but only while the file on disk still matches its recorded
 baseline. Locally modified files are never overwritten by default: a sibling
 <target>.new is written instead. With --force, the existing file is backed up and
 replaced after confirmation; use --force=yes to confirm without prompting. An
-optional positional [target] limits the run to a single app-relative file. Use
---dry-run to preview.
+optional positional [target] limits the run to a single app-relative file. Without
+a target, sync also refreshes the citomni/installer block in an existing .gitignore
+from every installed package, also with --package. Use --dry-run to preview.
 
 Exit codes:
   0  up to date / applied      4  conflicts / .new written (manual action)

@@ -18,6 +18,7 @@ namespace CitOmni\Installer\Operation;
 use CitOmni\Installer\Enum\Environment;
 use CitOmni\Installer\Exception\FilesystemException;
 use CitOmni\Installer\Exception\InstallerException;
+use CitOmni\Installer\State\ScaffoldState;
 use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\ScaffoldRenderer;
 use CitOmni\Installer\Util\UnifiedDiff;
@@ -340,13 +341,19 @@ final class BuildMigrationDiagnostics {
 	/**
 	 * Build the consolidated blocking review list from actual apply outcomes.
 	 *
+	 * A failed or conflicting .gitignore block is listed under the installer's own name.
+	 *
 	 * @param array<string,mixed> $result Apply/materialization result.
 	 * @return list<array<string,mixed>> Files that still require human or corrective action.
 	 */
 	public function blockingManualReview(array $result): array {
 		$manual = [];
+		$packages = (array)($result['packages'] ?? []);
+		if (\is_array($result['gitignore'] ?? null)) {
+			$packages[] = ['name' => ScaffoldState::GENERATOR, 'files' => [$result['gitignore']]];
+		}
 
-		foreach ((array)($result['packages'] ?? []) as $package) {
+		foreach ($packages as $package) {
 			$packageName = (string)($package['name'] ?? '');
 			foreach ((array)($package['files'] ?? []) as $file) {
 				$applied = (string)($file['applied'] ?? '');

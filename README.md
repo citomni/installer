@@ -20,6 +20,7 @@ In practical terms, `citomni/installer` lets CitOmni keep `citomni/app-skeleton`
 - **Neutral app skeleton support** so `citomni/app-skeleton` can remain a thin application container instead of a pile of mode-specific runtime files.
 - **Conservative write behavior** with no blind overwrites, `.new` files for locally modified managed targets during sync, confirmation before plain forced replacement, and backups before forced overwrites.
 - **Stateful managed-file sync** using both raw stub checksums and rendered-file checksums to separate upstream scaffold drift from local changes.
+- **Generated `.gitignore` block** that keeps package-managed scaffold targets and package runtime paths out of Git, while every other line stays app-owned.
 - **Bootstrap-independent CLI** through `vendor/bin/citomni-installer`, without requiring `citomni/cli`, `citomni/http`, or a running CitOmni application.
 - **Stable JSON output** for project tooling, CI, deploy hooks, and other automation that needs machine-readable scaffold status.
 
@@ -61,6 +62,7 @@ No smoke, no mirrors, and preferably no wizard hat in production.
 - Registration of rendered files in app-local installer state.
 - Conservative handling of existing unknown files.
 - Targeted package filtering through `--package=vendor/package` after the initial application-wide materialization.
+- One delimited block in an existing `.gitignore`, generated from every installed manifest.
 
 ### Scaffold lifecycle commands
 
@@ -94,6 +96,7 @@ That includes:
 - Placeholder resolution and simple placeholder rendering.
 - Plan-first scaffold decisions.
 - Safe write behavior for scaffold targets, `.new` files, backups, and state.
+- The delimited `citomni/installer` block in the application's `.gitignore`.
 - App-local scaffold state format.
 - Checksum semantics for raw stubs and rendered files.
 - Read-only status and doctor diagnostics.
@@ -219,9 +222,9 @@ Examples:
 - `bin/citomni` comes from `citomni/cli`.
 - `config/citomni_installer.php` may be added by the app to provide versioned placeholder configuration when scaffold placeholders are needed.
 
-After `composer create-project`, root-level files are app-owned. Outside the explicit legacy `migrate` workflow, `citomni/installer` writes only targets declared by discovered scaffold manifests. App-owned files such as `README.md`, `.gitignore`, `composer.json`, and `composer.lock` should therefore not be declared as package-owned scaffold targets.
+After `composer create-project`, root-level files are app-owned. Outside the explicit legacy `migrate` workflow, `citomni/installer` writes only targets declared by discovered scaffold manifests, plus its own delimited block in an existing `.gitignore` (see [.gitignore block](#gitignore-block)); every line outside that block stays app-owned. App-owned files such as `README.md`, `.gitignore`, `composer.json`, and `composer.lock` should therefore not be declared as package-owned scaffold targets. `.gitignore` is reserved and rejected as a target.
 
-During legacy migration only, the installer may compare `.gitignore`, `.gitattributes`, and `composer.json` with one pinned current `citomni/app-skeleton` commit. A difference produces an advisory sibling `<target>.new`; the live app-owned root file is never replaced by this audit.
+During legacy migration only, the installer may compare `.gitignore`, `.gitattributes`, and `composer.json` with one pinned current `citomni/app-skeleton` commit. A difference produces an advisory sibling `<target>.new`; the live app-owned root file is never replaced by this audit. The installer block is left out of the `.gitignore` comparison and carried into `.gitignore.new`.
 
 ---
 
@@ -313,6 +316,20 @@ vendor/bin/citomni-installer repair --package=citomni/http
 
 `repair` is not historical restore. It recreates only missing targets that already have recorded installer state, using the currently installed package stub together with the placeholder snapshot stored in that state.
 
+### Stop versioning package-managed scaffold
+
+Package-managed targets are rendered per installation, like `vendor/`. In an application that still commits them, write the `.gitignore` block once and untrack the targets it lists as newly ignored:
+
+```bash
+vendor/bin/citomni-installer sync
+git rm --cached --ignore-unmatch -- .htaccess bin/citomni public/index.php
+git commit -m "Stop versioning package-managed scaffold"
+```
+
+Use the exact paths from the `sync` output; `--ignore-unmatch` skips listed targets that were never tracked. After that, a fresh checkout, a new server or a build workspace materializes these files with `install --environment=<env>`.
+
+Every other checkout deletes these files when it pulls that commit, because Git removes files that a pulled commit stops tracking. Run `citomni-installer sync` (or `install --environment=<env>` without recorded state) right after pulling. A server that deploys with `git pull` must do so before it serves traffic, or it loses its front controller and the protecting `.htaccess` files.
+
 ---
 
 ## Composer scripts
@@ -374,6 +391,8 @@ Shows scaffold status without changing files.
 
 It reports whether known scaffold targets are missing, clean, locally modified, affected by upstream stub changes, affected by placeholder changes, or blocked from automatic sync.
 
+It also compares the [.gitignore block](#gitignore-block) with every installed package, including with `--package`: `up_to_date`, `update_available` (exit `3`), `malformed` (exit `4`), `absent` when the application has no `.gitignore`, or `unsupported` when the installer cannot maintain it, such as a symlinked `.gitignore`.
+
 Examples:
 
 ```bash
@@ -391,8 +410,15 @@ Default behavior:
 - Creates missing files.
 - Does not overwrite existing files.
 - Registers created files and adopts existing exact rendered matches in installer state.
+- Leaves a clean recorded baseline that lags behind the installed package to `sync`.
 - Stores checksum and placeholder metadata where relevant.
+- Writes the [.gitignore block](#gitignore-block) from every installed package, also with `--package`. Malformed block markers stop install before it writes anything.
 - Fails clearly on conflicts.
+
+An existing environment-aware target that differs from the requested rendering stops install before anything is written. The error names every blocking target with its reason, and JSON output lists them under `packages`:
+
+- `unknown_existing`: there is no recorded baseline, so another environment, an older package revision, and a local edit cannot be told apart. Delete a stale package-managed file so install recreates it, or install the environment the file belongs to and switch with `environment <env>`.
+- `local_modified`: the file differs from its recorded baseline. `sync` writes the current rendering as `.new` for review; `environment <env>` replaces it after a backup.
 
 Initial materialization:
 
@@ -430,9 +456,12 @@ The command is deliberately repeatable:
   they differ.
 - `config/citomni_installer.php` is audited for missing and currently unused values.
 - Current package scaffold sources are scanned for `%UPPER_SNAKE_CASE%`-style tokens and reported as advisory source-hygiene warnings without changing migrate exit behavior.
+- The [.gitignore block](#gitignore-block) is refreshed from every installed package;
+  malformed block markers stop migration before it writes anything.
 - `.gitignore`, `.gitattributes`, and `composer.json` are compared with one pinned
   current `citomni/app-skeleton` commit using text semantics that ignore CRLF/LF and
-  one final-newline difference; real content differences are written as `.new`.
+  one final-newline difference; real content differences are written as `.new`. The
+  installer block is left out of the `.gitignore` comparison and kept in `.gitignore.new`.
 - App-owned `.php` and `.php.tpl` files are recursively checked with `php -l`; vendor,
   caches, backups, uploads, Git metadata, node_modules, and root `_...` workspaces are
   excluded. Full lint output is stored in the migration report.
@@ -479,6 +508,7 @@ Default behavior:
 - Updates the baseline for files it recreates.
 - Reports `recreated_stub_drift` when the recorded stub checksum differs from the currently installed package stub.
 - Ignores `--force`; existing files are never touched by `repair`.
+- Does not touch `.gitignore`.
 
 Example:
 
@@ -498,6 +528,7 @@ Default behavior:
 - Writes the current rendered scaffold to `.new` when a local modification blocks automatic sync.
 - Adopts an unknown existing managed file into state without rewriting it when its bytes exactly match the current rendered scaffold.
 - Does not update existing `create-only` files by default; forced replacement requires `--force` or `--force=yes`.
+- Refreshes the [.gitignore block](#gitignore-block) from every installed package, also with `--package`. A positional target leaves `.gitignore` alone.
 
 Example:
 
@@ -645,6 +676,34 @@ Supported MVP policies:
 
 Write behavior is controlled by `policy`, not by `type`.
 
+### `gitignore`
+
+Optional top-level list of `.gitignore` lines for runtime paths the package creates in the application, such as caches, logs and secrets. Accepted in manifest versions `1` and `2`.
+
+```php
+'gitignore' => [
+	'/var/cache/*',
+	'/var/backups/*',
+	'/var/backups/flags/*',
+	'!/var/cache/.gitkeep',
+	'!/var/backups/flags/',
+	'!/var/backups/flags/.gitkeep',
+],
+```
+
+The installer merges every package's lines into one [.gitignore block](#gitignore-block), with all ignore rules before all exceptions. Discovery therefore enforces:
+
+- One rule per entry, without comments, control characters, backslash escapes, or leading or trailing whitespace.
+- Ignore rules before exceptions. The merge keeps that order, so each package's own meaning is unchanged.
+- An exception (`!`) is an anchored literal path without wildcards, so it cannot re-include paths it does not name. Because every exception follows every ignore rule, it does override any package's ignore rule for exactly that path.
+- A directory is kept only in directory form (`!/var/backups/flags/`), and the same package must ignore its contents with `/var/backups/flags/*` or `/var/backups/flags/**`. The directory's contents then stay ignored unless their own exceptions name them. An exception counts as a directory when it ends with `/` or when any package declares `/var/backups/flags/` or a rule beneath it; any other exception names a file.
+- A kept file must not be ignored by the identical rule in any package; the packages would disagree about that path.
+- No exception may lie beneath a directory that any package ignores with an anchored literal rule (`/data/` or `/data`), unless that directory is itself kept in directory form; Git cannot re-include a file inside an excluded directory. Ignore the contents (`/data/*`) instead.
+
+These checks span all installed packages and look only at the declared rules, never at the application's files. Wildcard rules are not evaluated as directory signals, so an exception for a directory must always use the directory form.
+
+Managed targets are added to the block automatically and do not belong in this list.
+
 ---
 
 ## File policies
@@ -682,6 +741,47 @@ Rules:
 - Do not update automatically.
 - Do not treat upstream drift as an automatic update signal.
 - Require explicit force or manual action for replacement.
+
+---
+
+## .gitignore block
+
+Managed targets are rendered per installation from the installed packages, like `vendor/`, so they should not be committed. A committed managed file goes stale as soon as its package changes, and an install without recorded state cannot tell a stale rendering from another environment or a local edit. The installer therefore keeps one delimited block in the application's `.gitignore`:
+
+```gitignore
+###> citomni/installer ###
+# Generated by citomni/installer from the installed package manifests.
+# Rewritten by install, sync and migrate; edits inside this block are lost.
+# Application rules belong after the block.
+
+# Package runtime paths
+/var/cache/*
+
+# Package runtime files kept in Git
+!/var/cache/.gitkeep
+
+# Package-managed scaffold targets
+/.htaccess
+/bin/citomni
+/public/index.php
+###< citomni/installer ###
+
+# Application rules
+/var/storage/
+```
+
+Rules:
+
+- The block is generated from every installed manifest: each package's [`gitignore`](#gitignore) lines plus every `managed` target. `create-only` targets are app-owned after creation and stay versioned.
+- Lines are grouped as ignore rules, kept files and managed targets, and each group is sorted and deduplicated, so the bytes do not depend on package order. Kept files win over every ignore rule in the block, and managed targets stay ignored even when a kept file names them.
+- `install`, `migrate` and `sync` without a positional target rewrite the block, also with `--package`. `repair` and `environment` never touch `.gitignore`. `status` reports a stale block as an update (exit `3`). Without any scaffold manifest, no command maintains or reports the block.
+- The block contains no environment or timestamp, so it is identical on every machine with the same packages.
+- Everything outside the markers is preserved byte for byte, including line endings and a UTF-8 BOM. A new block is inserted at the top, after marker blocks of other tools, followed by a blank line. Git uses the last matching pattern, so application rules below the block have the final say.
+- A missing `.gitignore` is not created (`absent`). A `.gitignore` the installer cannot maintain is reported as `unsupported` and left alone; it never fails a command. That covers a symlink, even one pointing inside the application, because Git does not read a symlinked `.gitignore` from the working tree, as well as a directory or an unreadable file.
+- Marker lines tolerate trailing spaces and tabs and are rewritten exactly. Malformed markers (missing, repeated, out of order, or another line starting like a marker) are a conflict and leave the file untouched: `install` and `migrate` stop before writing anything, `sync` reports the conflict (exit `4`), and `status` exits `4`.
+- Managed targets are written as anchored literal paths; wildcard characters and trailing spaces are escaped.
+
+Git keeps tracking files it already tracks. When the block starts ignoring a managed target, the output lists it as newly ignored (`newly_ignored` in JSON). Untrack it once with `git rm --cached --ignore-unmatch -- <path>` and commit the result; see [Stop versioning package-managed scaffold](#stop-versioning-package-managed-scaffold) for what that means for other checkouts.
 
 ---
 
@@ -801,6 +901,8 @@ The table below covers ordinary scaffold lifecycle commands. `environment <env>`
 | Managed target matches previous `rendered_checksum` | Leave unchanged if it also matches the current render; otherwise update to the current render |
 | Target is locally modified | Do not overwrite |
 | Target is `create-only` and exists | Do not touch unless explicitly forced |
+| Environment-aware target differs during `install` | Stop before writing and list every blocking target |
+| `.gitignore` installer block differs | Rewrite the block only; malformed markers conflict, and `install`/`migrate` stop before writing |
 | Target is outside app root | Fail |
 | Source is missing in package | Fail |
 | Manifest is invalid | Fail |
@@ -840,8 +942,9 @@ Exit codes:
 
 Examples:
 
-- `status` may return `3` when an update is available but no local conflict exists.
+- `status` may return `3` when an update is available but no local conflict exists, including a stale `.gitignore` block.
 - `status` may return `4` when local changes block sync.
+- `install` returns `4` without writing when an environment-aware target conflicts.
 - `sync` may return `4` when it writes `.new` because a local file was modified.
 - `doctor` may return `5` when the state format is unknown.
 
@@ -858,6 +961,8 @@ vendor/bin/citomni-installer status --format=json
 ```
 
 JSON output should be stable enough for project tooling and automation. It includes package name, type, policy, target, status, reason, and action values that tooling can use to infer whether a file can be synced without conflict.
+
+`status` and the write commands also return a top-level `gitignore` key: an object with `target`, `status`, `reason`, `newly_ignored`, and `error`, where write commands add `action`, `applied` (`null` when the command stopped before applying), and `error_type`. It is `null` when the command does not maintain the block, including early failures. When `install` stops before writing, `error` explains the conflict, and `packages` lists the blocking targets or `gitignore` carries the malformed block.
 
 Interactive confirmation is not available in JSON mode. When a forced overwrite is required, automation must use `--force=yes`; plain `--force --format=json` returns an invalid-usage response instead of prompting.
 

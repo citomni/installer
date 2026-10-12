@@ -37,6 +37,9 @@ use CitOmni\Installer\Support\InstallerLock;
  * reads through scaffold writes, Composer when applicable, and state persistence.
  * Dry runs do not acquire the lock or write any application files.
  *
+ * Commands that maintain the installer block in .gitignore plan it from every
+ * discovered manifest, also when --package narrows the scaffold files.
+ *
  * Exit codes:
  * - 0: Every actionable file succeeded, or nothing needs changing.
  * - 1: General validation, planning, Composer, or internal apply failure.
@@ -66,6 +69,11 @@ abstract class AbstractWriteCommand {
 
 	/** Whether a single positional [target] is accepted (sync only). */
 	protected function acceptsPositionalTarget(): bool {
+		return false;
+	}
+
+	/** Whether the inherited flow maintains the .gitignore block when no positional target narrows it (sync only). */
+	protected function maintainsGitignore(): bool {
 		return false;
 	}
 
@@ -106,7 +114,7 @@ abstract class AbstractWriteCommand {
 
 		// -- 3. Manifests ---------------------------------------------
 		try {
-			$manifests = $this->resolveManifests($opt['package']);
+			[$discovered, $manifests] = $this->resolveManifests($opt['package']);
 		} catch (InstallerException $e) {
 			return $this->fail($format, $e->getMessage(), $this->exceptionExitCode($e));
 		}
@@ -141,6 +149,8 @@ abstract class AbstractWriteCommand {
 		$buildOptions = ['force' => $opt['force']];
 		if ($target !== null) {
 			$buildOptions['target'] = $target;
+		} elseif ($this->maintainsGitignore()) {
+			$buildOptions['gitignore'] = $this->locator->gitignoreRules($discovered);
 		}
 		try {
 			$plan = $this->builder->build($this->commandName(), $manifests, $placeholders, $buildOptions);
@@ -237,15 +247,20 @@ abstract class AbstractWriteCommand {
 	}
 
 	/**
-	 * @return array<string,array<string,mixed>>
+	 * Discover every scaffold manifest once and select the requested package.
+	 *
+	 * Discovery validates global target ownership before the package filter applies.
+	 *
+	 * @return array{0:array<string,array<string,mixed>>,1:array<string,array<string,mixed>>}
+	 *         [all discovered manifests, manifests selected by --package].
 	 * @throws InstallerException
 	 */
 	protected function resolveManifests(?string $package): array {
+		$discovered = $this->locator->discover();
 		if ($package === null) {
-			return $this->locator->discover();
+			return [$discovered, $discovered];
 		}
-		$one = $this->locator->discoverPackage($package);
-		return $one === null ? [] : [$package => $one];
+		return [$discovered, isset($discovered[$package]) ? [$package => $discovered[$package]] : []];
 	}
 
 
@@ -338,6 +353,45 @@ abstract class AbstractWriteCommand {
 		return $count;
 	}
 
+	/**
+	 * Return the conflicting plan entries in the public JSON file shape.
+	 *
+	 * Used when a command stops before applying, so the report still names every
+	 * blocking target and its reason.
+	 *
+	 * @param  array<string,mixed>  $plan
+	 * @return list<array{name:string,installed_version:string,files:list<array<string,string>>}>
+	 */
+	protected function conflictPackages(array $plan): array {
+		$packages = [];
+
+		foreach ((array)($plan['packages'] ?? []) as $pkg) {
+			$files = [];
+			foreach ((array)($pkg['files'] ?? []) as $file) {
+				if (($file['action'] ?? null) !== 'conflict') {
+					continue;
+				}
+				$files[] = [
+					'target' => (string)($file['target'] ?? ''),
+					'type'   => (string)($file['type'] ?? ''),
+					'policy' => (string)($file['policy'] ?? ''),
+					'status' => (string)($file['status'] ?? ''),
+					'reason' => (string)($file['reason'] ?? ''),
+					'action' => 'conflict',
+				];
+			}
+			if ($files !== []) {
+				$packages[] = [
+					'name'              => (string)($pkg['name'] ?? ''),
+					'installed_version' => (string)($pkg['installed_version'] ?? 'unknown'),
+					'files'             => $files,
+				];
+			}
+		}
+
+		return $packages;
+	}
+
 
 
 
@@ -352,14 +406,19 @@ abstract class AbstractWriteCommand {
 	 * Map the apply result to an exit code.
 	 *
 	 * Precedence: Filesystem failures (6), general failures (1), conflicts (4), success (0).
-	 * Per-file error_type preserves the filesystem/conflict distinction. State-read
-	 * validation is mapped separately by the caller to unsafe state (5).
+	 * Per-file error_type preserves the filesystem/conflict distinction. The .gitignore
+	 * block outcome counts like a file. State-read validation is mapped separately by
+	 * the caller to unsafe state (5).
 	 */
 	protected function exitCodeFor(array $result): int {
 		$hasIoFailure = false;
 		$hasFailure  = false;
 		$hasConflict = false;
-		foreach ((array)($result['packages'] ?? []) as $pkg) {
+		$packages = (array)($result['packages'] ?? []);
+		if (\is_array($result['gitignore'] ?? null)) {
+			$packages[] = ['files' => [$result['gitignore']]];
+		}
+		foreach ($packages as $pkg) {
 			foreach ((array)($pkg['files'] ?? []) as $file) {
 				switch ((string)($file['applied'] ?? '')) {
 					case 'failed':
@@ -434,6 +493,7 @@ abstract class AbstractWriteCommand {
 		if (!$any) {
 			$out .= "No scaffold files matched.\n";
 		}
+		$out .= $this->gitignoreText($result['gitignore'] ?? null);
 		if (!empty($result['backup_dir'])) {
 			$out .= "\nBackups: " . (string)$result['backup_dir'] . "\n";
 		}
@@ -526,6 +586,7 @@ abstract class AbstractWriteCommand {
 			'environment'   => isset($result['environment']) ? (string)$result['environment'] : null,
 			'composer'      => isset($result['composer']) && \is_array($result['composer']) ? $result['composer'] : null,
 			'packages'      => $packages,
+			'gitignore'     => $this->gitignoreJson($result['gitignore'] ?? null),
 		];
 		if (isset($result['migration']) && \is_array($result['migration'])) {
 			$payload['migration'] = $result['migration'];
@@ -545,6 +606,91 @@ abstract class AbstractWriteCommand {
 		return $dryRun ? $label . ' (no changes written)' : $label;
 	}
 
+	/**
+	 * Render the .gitignore block outcome for text output.
+	 *
+	 * Newly ignored scaffold targets are listed because Git keeps tracking files it
+	 * already tracks; they need a one-time `git rm --cached`.
+	 *
+	 * @param  mixed  $block  Block result from ApplyScaffoldPlan, or null when not planned.
+	 * @return string         Text section, or '' when there is nothing to report.
+	 */
+	protected function gitignoreText(mixed $block): string {
+		if (!\is_array($block)) {
+			return '';
+		}
+
+		$applied = (string)($block['applied'] ?? '');
+		$out = "\n.gitignore block\n" . \rtrim(\sprintf(
+			"  %-32s %-12s %s",
+			(string)($block['target'] ?? ''),
+			$applied,
+			(string)($block['reason'] ?? '')
+		)) . "\n";
+		if (isset($block['error'])) {
+			$out .= '      error:  ' . (string)$block['error'] . "\n";
+		}
+
+		$newlyIgnored = (array)($block['newly_ignored'] ?? []);
+		if ($applied === 'updated' && $newlyIgnored !== []) {
+			foreach ($newlyIgnored as $target) {
+				$out .= '      now ignored: ' . (string)$target . "\n";
+			}
+			$out .= "      Git keeps tracking files it already tracks. Untrack them once: git rm --cached --ignore-unmatch -- <path>...\n";
+		}
+
+		return $out;
+	}
+
+	/**
+	 * Shape a planned or applied .gitignore block entry for JSON output.
+	 *
+	 * @param  mixed  $block  Block entry from BuildScaffoldPlan or ApplyScaffoldPlan, or null.
+	 * @return array<string,mixed>|null  Public fields; `applied` is null before apply.
+	 */
+	protected function gitignoreJson(mixed $block): ?array {
+		if (!\is_array($block)) {
+			return null;
+		}
+
+		return [
+			'target'        => (string)($block['target'] ?? ''),
+			'status'        => (string)($block['status'] ?? ''),
+			'reason'        => (string)($block['reason'] ?? ''),
+			'action'        => (string)($block['action'] ?? 'none'),
+			'applied'       => isset($block['applied']) ? (string)$block['applied'] : null,
+			'newly_ignored' => \array_values(\array_map('strval', (array)($block['newly_ignored'] ?? []))),
+			'error_type'    => isset($block['error_type']) ? (string)$block['error_type'] : null,
+			'error'         => isset($block['error']) ? (string)$block['error'] : null,
+		];
+	}
+
+	/**
+	 * Stop before applying when the planned .gitignore block cannot be written.
+	 *
+	 * Install and migrate commit scaffold state and Composer posture only after a fully
+	 * successful apply. Malformed markers in an app-owned file must not leave them half
+	 * done, so these commands check the block first, like the environment gate.
+	 *
+	 * @param  array<string,mixed>  $plan  Built plan.
+	 * @param  string  $format  Output format.
+	 * @return int|null  Conflict exit code after reporting, or null when the block is writable.
+	 */
+	protected function failOnGitignoreConflict(array $plan, string $format): ?int {
+		$block = $plan['gitignore'] ?? null;
+		if (!\is_array($block) || ($block['action'] ?? null) !== 'conflict') {
+			return null;
+		}
+
+		return $this->fail(
+			$format,
+			\ucfirst($this->commandName()) . ' stopped before writing: ' . (string)($block['error'] ?? 'the .gitignore block cannot be updated.'),
+			ExitCode::CONFLICT->value,
+			[],
+			$this->gitignoreJson($block)
+		);
+	}
+
 
 	// ----------------------------------------------------------------
 	// Early returns (no plan was applied)
@@ -560,6 +706,7 @@ abstract class AbstractWriteCommand {
 				'exit_code' => ExitCode::OK->value,
 				'command'   => $this->commandName(),
 				'packages'  => [],
+				'gitignore' => null,
 			]) . "\n");
 		} else {
 			\fwrite(\STDOUT, "No CitOmni scaffold manifests found.\n");
@@ -567,14 +714,25 @@ abstract class AbstractWriteCommand {
 		return ExitCode::OK->value;
 	}
 
-	protected function fail(string $format, string $message, int $exit): int {
+	/**
+	 * Report a command that stopped before applying a plan.
+	 *
+	 * @param  string  $format    Output format.
+	 * @param  string  $message   Human-readable reason, self-contained for both formats.
+	 * @param  int     $exit      Exit code.
+	 * @param  list<array<string,mixed>>  $packages  Blocking plan entries for JSON, from conflictPackages().
+	 * @param  array<string,mixed>|null   $gitignore  Blocking .gitignore block entry for JSON, from gitignoreJson().
+	 * @return int  The exit code.
+	 */
+	protected function fail(string $format, string $message, int $exit, array $packages = [], ?array $gitignore = null): int {
 		if ($format === 'json') {
 			\fwrite(\STDOUT, InstallerCli::encodeJson([
 				'ok'        => false,
 				'exit_code' => $exit,
 				'command'   => $this->commandName(),
 				'error'     => $message,
-				'packages'  => [],
+				'packages'  => $packages,
+				'gitignore' => $gitignore,
 			]) . "\n");
 		} else {
 			\fwrite(\STDERR, $message . "\n");

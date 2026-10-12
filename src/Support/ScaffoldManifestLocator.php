@@ -17,6 +17,7 @@ namespace CitOmni\Installer\Support;
 
 use CitOmni\Installer\Enum\Environment;
 use CitOmni\Installer\State\ScaffoldState;
+use CitOmni\Installer\Util\GitignoreBlock;
 use CitOmni\Installer\Util\Path;
 use CitOmni\Installer\Exception\InstallerException;
 
@@ -33,6 +34,8 @@ use CitOmni\Installer\Exception\InstallerException;
  * - A file declares exactly one of `source` or `environments`.
  * - Environment-aware files must cover every Environment value exactly and must use
  *   policy `managed`.
+ * - Both versions accept an optional `gitignore` list of .gitignore lines for runtime
+ *   paths the package creates in the application (see validateGitignore()).
  */
 final class ScaffoldManifestLocator {
 
@@ -94,6 +97,7 @@ final class ScaffoldManifestLocator {
 		}
 
 		$this->assertUniqueTargets($out);
+		$this->assertSafeGitignoreExceptions($out);
 		return $out;
 	}
 
@@ -116,10 +120,13 @@ final class ScaffoldManifestLocator {
 	 *
 	 * Resolved identities also detect aliases through symlinks. Windows uses a
 	 * conservative case-insensitive comparison, including targets not yet created.
+	 * Installer metadata and the .gitignore that carries the installer block are
+	 * reserved. The .gitignore is compared by its target string, so an unusual
+	 * .gitignore (such as a symlink leaving the application) never breaks discovery.
 	 *
 	 * @param array<string,array<string,mixed>> $manifests Complete discovered manifests.
 	 * @return void
-	 * @throws InstallerException When targets overlap or claim installer metadata.
+	 * @throws InstallerException When targets overlap or claim a reserved path.
 	 */
 	private function assertUniqueTargets(array $manifests): void {
 		$reserved = [];
@@ -134,9 +141,15 @@ final class ScaffoldManifestLocator {
 				if (\PHP_OS_FAMILY === 'Windows') {
 					$key = \strtolower($key);
 				}
+				$claimsGitignore = $caseInsensitive
+					? \strcasecmp($file['target'], GitignoreBlock::FILE) === 0
+					: $file['target'] === GitignoreBlock::FILE;
+				if ($claimsGitignore) {
+					throw new InstallerException('Scaffold target claims a path reserved by citomni/installer: ' . $file['target']);
+				}
 				foreach ($reserved as $path) {
 					if (Path::isInside($path, $key, $caseInsensitive) || Path::isInside($key, $path, $caseInsensitive)) {
-						throw new InstallerException('Scaffold target claims installer metadata: ' . $file['target']);
+						throw new InstallerException('Scaffold target claims a path reserved by citomni/installer: ' . $file['target']);
 					}
 				}
 				if (isset($owners[$key])) {
@@ -152,6 +165,98 @@ final class ScaffoldManifestLocator {
 					throw new InstallerException('Scaffold file/directory collision between ' . $owners[$parent] . ' and ' . $owner . '.');
 				}
 				$parent = \dirname($parent);
+			}
+		}
+	}
+
+
+	/**
+	 * Check every .gitignore exception against the rules of all installed packages.
+	 *
+	 * In the merged block every exception follows every ignore rule, so an exception
+	 * overrides rules of other packages. These checks keep that override narrow.
+	 *
+	 * Behavior:
+	 * - A kept directory must use the directory form (`!/dir/`), whose own package also
+	 *   ignores the directory's contents (enforced by validateGitignore()). An exception
+	 *   names a directory when it ends with "/" or when any package declares a rule for
+	 *   `/dir/` or beneath it. Re-including a directory node in any other form would
+	 *   expose every file inside it.
+	 * - Any other exception names a file and must not keep a path that a package ignores
+	 *   with the identical rule; the packages disagree about that path.
+	 * - An exception beneath a directory that a package ignores with an anchored literal
+	 *   rule can never take effect, because Git cannot re-include a file inside an
+	 *   excluded directory, unless an exception re-includes that directory in directory form.
+	 *
+	 * Notes:
+	 * - Only declared rules are evaluated, never the application's files. An exception
+	 *   without any directory signal is treated as naming a file.
+	 *
+	 * @param array<string,array<string,mixed>> $manifests Complete discovered manifests.
+	 * @return void
+	 * @throws InstallerException When an exception is unsafe, conflicting, or ineffective.
+	 */
+	private function assertSafeGitignoreExceptions(array $manifests): void {
+		// -- 1. Index every declared line with its package ---------------
+		$lines = [];
+		$keptDirectories = [];
+		foreach ($manifests as $name => $manifest) {
+			foreach ([...(array)($manifest['gitignore']['ignore'] ?? []), ...(array)($manifest['gitignore']['exceptions'] ?? [])] as $line) {
+				$lines[] = [(string)$name, (string)$line];
+				if ($line[0] === '!' && \str_ends_with($line, '/')) {
+					$keptDirectories[\rtrim(\substr($line, 1), '/')] = true;
+				}
+			}
+		}
+
+		foreach ($manifests as $name => $manifest) {
+			foreach ((array)($manifest['gitignore']['exceptions'] ?? []) as $exception) {
+				$path = \rtrim(\substr($exception, 1), '/');
+				$directoryForm = \str_ends_with($exception, '/');
+
+				foreach ($lines as [$owner, $line]) {
+					$rule = \ltrim($line, '!');
+
+					// -- 2. A directory must be kept in directory form ----------
+					if (!$directoryForm && \str_starts_with($rule, $path . '/')) {
+						throw new InstallerException(\sprintf(
+							'Scaffold manifest for %s keeps %s, which is a directory because %s declares %s. Keeping it in this form keeps every file inside it; write "!%s/" and ignore its contents with "%s/*" in %s.',
+							$name,
+							\var_export($exception, true),
+							$owner,
+							\var_export($line, true),
+							$path,
+							$path,
+							$name
+						));
+					}
+
+					// -- 3. A kept file must not be ignored by the identical rule --
+					if (!$directoryForm && $line === $path) {
+						throw new InstallerException(\sprintf(
+							'Scaffold manifest for %s keeps %s, which %s ignores with the identical rule. A path cannot be both ignored and kept; remove one of the rules.',
+							$name,
+							\var_export($exception, true),
+							$owner
+						));
+					}
+
+					// -- 4. Nothing beneath a literally ignored directory --------
+					if ($line[0] === '!' || !\str_starts_with($line, '/') || \strpbrk($line, '*?[') !== false) {
+						continue;
+					}
+					$ignored = \rtrim($line, '/');
+					if (\str_starts_with($path, $ignored . '/') && !isset($keptDirectories[$ignored])) {
+						throw new InstallerException(\sprintf(
+							'Scaffold manifest for %s keeps %s, but %s ignores its parent directory with %s. Git cannot re-include a file inside an excluded directory; ignore "%s/*" instead.',
+							$name,
+							\var_export($exception, true),
+							$owner,
+							\var_export($line, true),
+							$ignored
+						));
+					}
+				}
 			}
 		}
 	}
@@ -216,6 +321,41 @@ final class ScaffoldManifestLocator {
 		});
 
 		return $targets;
+	}
+
+
+	/**
+	 * Collect the input for the installer block in the application's .gitignore.
+	 *
+	 * Behavior:
+	 * - Returns every package's declared ignore rules and exceptions.
+	 * - Adds every managed target. Create-only targets are app-owned after creation and
+	 *   therefore stay versioned.
+	 * - Leaves ordering and duplicates to GitignoreBlock::body(), which canonicalizes them.
+	 *
+	 * Notes:
+	 * - Pass discover() output. A package filter or an environment-only selection would
+	 *   drop rules of other packages from the block.
+	 *
+	 * @param array<string,array<string,mixed>> $manifests Discovered manifests.
+	 * @return array{ignore:list<string>,exceptions:list<string>,targets:list<string>}
+	 */
+	public function gitignoreRules(array $manifests): array {
+		$rules = ['ignore' => [], 'exceptions' => [], 'targets' => []];
+
+		foreach ($manifests as $manifest) {
+			$gitignore = \is_array($manifest['gitignore'] ?? null) ? $manifest['gitignore'] : [];
+			\array_push($rules['ignore'], ...\array_values((array)($gitignore['ignore'] ?? [])));
+			\array_push($rules['exceptions'], ...\array_values((array)($gitignore['exceptions'] ?? [])));
+
+			foreach ((array)($manifest['files'] ?? []) as $file) {
+				if (($file['policy'] ?? null) === 'managed') {
+					$rules['targets'][] = (string)$file['target'];
+				}
+			}
+		}
+
+		return $rules;
 	}
 
 
@@ -421,7 +561,111 @@ final class ScaffoldManifestLocator {
 			'installed_version' => $installedVersion,
 			'manifest_path'     => $manifestPath,
 			'files'             => $normalized,
+			'gitignore'         => $this->validateGitignore($name, $manifestPath, $manifest['gitignore'] ?? []),
 		];
+	}
+
+
+	/**
+	 * Validate the optional manifest `gitignore` list and split it into rules and exceptions.
+	 *
+	 * The installer merges every package's lines into one block: all ignore rules first,
+	 * then all exceptions. The rules below keep that merge free of surprises.
+	 *
+	 * Behavior:
+	 * - Each entry is one .gitignore line without comment, escape (backslash), control
+	 *   character or surrounding whitespace.
+	 * - Ignore rules precede exceptions, so grouping cannot change the package's own meaning.
+	 * - An exception (`!`) names one anchored literal path without wildcards, so it cannot
+	 *   re-include paths it does not name. It can override any ignore rule for that path.
+	 * - A directory exception (`!/dir/`) requires `/dir/*` or `/dir/**` from the same
+	 *   package, so its contents stay ignored unless named by their own exceptions.
+	 * - discover() checks the exceptions against every package's rules (see
+	 *   assertSafeGitignoreExceptions()).
+	 *
+	 * Typical usage (manifest):
+	 *   'gitignore' => ['/var/cache/*', '!/var/cache/.gitkeep'],
+	 *
+	 * @param string $name Package name.
+	 * @param string $manifestPath Absolute manifest path.
+	 * @param mixed $lines Declared `gitignore` value.
+	 * @return array{ignore:list<string>,exceptions:list<string>}
+	 * @throws InstallerException When the list or one of its entries is invalid.
+	 */
+	private function validateGitignore(string $name, string $manifestPath, mixed $lines): array {
+		if (!\is_array($lines) || !\array_is_list($lines)) {
+			throw new InstallerException(\sprintf(
+				'Scaffold manifest for %s has an invalid "gitignore"; expected a list of strings: %s',
+				$name,
+				$manifestPath
+			));
+		}
+
+		$ignore = [];
+		$exceptions = [];
+		foreach ($lines as $index => $line) {
+			$defect = match (true) {
+				!\is_string($line) || $line === '' => 'must be a non-empty string',
+				\preg_match('/[\x00-\x1F\x7F]/', $line) === 1 => 'contains a control character',
+				\trim($line, " \t") !== $line => 'has leading or trailing whitespace',
+				\str_contains($line, '\\') => 'contains a backslash; use "/" separators (escapes are not supported)',
+				$line[0] === '#' => 'is a comment, not a rule',
+				$line[0] === '!' => $this->gitignoreExceptionDefect($line, $ignore),
+				$exceptions !== [] => 'follows an exception; list ignore rules before exceptions',
+				\trim($line, '/') === '' => 'matches no path',
+				Path::hasTraversal(\trim($line, '/')) => 'contains a ".." segment',
+				default => null,
+			};
+
+			if ($defect !== null) {
+				throw new InstallerException(\sprintf(
+					'Scaffold manifest for %s gitignore [%d] %s %s: %s',
+					$name,
+					$index,
+					\var_export($line, true),
+					$defect,
+					$manifestPath
+				));
+			}
+
+			if ($line[0] === '!') {
+				$exceptions[] = $line;
+			} else {
+				$ignore[] = $line;
+			}
+		}
+
+		return ['ignore' => $ignore, 'exceptions' => $exceptions];
+	}
+
+
+	/**
+	 * Describe why a manifest .gitignore exception is invalid.
+	 *
+	 * @param string $line Exception line including the leading "!".
+	 * @param list<string> $ignore Ignore rules the same package declared before it.
+	 * @return string|null Defect description, or null when the exception is valid.
+	 */
+	private function gitignoreExceptionDefect(string $line, array $ignore): ?string {
+		$path = \substr($line, 1);
+		if (!\str_starts_with($path, '/')) {
+			return 'must be an anchored literal path such as "!/var/cache/.gitkeep"';
+		}
+		if (\strpbrk($path, '*?[') !== false) {
+			return 'must be a literal path without wildcards';
+		}
+
+		$directory = \str_ends_with($path, '/');
+		$relative = \substr($path, 1, $directory ? -1 : null);
+		if (!Path::isSafeRelative($relative) || Path::normalizeRelative($relative) !== $relative) {
+			return 'must name a safe, normalized application path';
+		}
+
+		if ($directory && !\in_array('/' . $relative . '/*', $ignore, true) && !\in_array('/' . $relative . '/**', $ignore, true)) {
+			return \sprintf('re-includes a directory; ignore its contents with "/%s/*" before the exceptions', $relative);
+		}
+
+		return null;
 	}
 
 
@@ -457,6 +701,16 @@ final class ScaffoldManifestLocator {
 					$manifestPath
 				));
 			}
+		}
+
+		// Managed targets become .gitignore lines, which cannot carry control characters.
+		if (\preg_match('/[\x00-\x1F\x7F]/', $file['target']) === 1) {
+			throw new InstallerException(\sprintf(
+				'Scaffold manifest for %s file [%s] has a target containing control characters: %s',
+				$name,
+				(string)$index,
+				$manifestPath
+			));
 		}
 
 		$hasSource = \array_key_exists('source', $file);

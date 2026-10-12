@@ -24,6 +24,17 @@ The initial install must include all discovered scaffold packages. A package fil
 cannot establish a global environment. Later installs may use `--package` with the
 recorded environment. `install --force` cannot switch an existing environment.
 
+Install adopts an existing environment-aware target only when its bytes equal the
+requested rendering. A clean recorded baseline of the same environment that lags
+behind its package (`update_available` or `placeholder_drift`) is left unchanged for
+`sync`. Any other difference stops install before it writes anything, and the error
+lists every blocking target with its status as the reason. `unknown_existing` means
+there is no recorded baseline, so another environment, an older package revision and
+a local edit cannot be told apart; `local_modified` means the file differs from its
+recorded baseline. A build or checkout that commits package-managed targets meets
+`unknown_existing` as soon as a package changes, which is why the installer keeps
+those targets in its `.gitignore` block (see the README).
+
 
 The `migrate` command is a repeatable migration/reconciliation path. When state is
 missing or v1, legacy package/file baselines are ignored and current installed manifests
@@ -38,8 +49,8 @@ to dev when omitted. Migration also reports `%UPPER_SNAKE_CASE%`-style tokens fo
 
 The `environment` command selects only environment-aware manifest entries. It
 replaces differing bytes with the selected environment's rendering and backs up
-existing targets before replacement. Ordinary source-only entries are unaffected.
-Repair and sync use the recorded environment and reject `--environment`.
+existing targets before replacement. Ordinary source-only entries and `.gitignore`
+are unaffected. Repair and sync use the recorded environment and reject `--environment`.
 
 ## Recovery after a failed command
 
@@ -51,7 +62,9 @@ and Composer steps succeed. There is no rollback command or automatic rollback.
 Correct the reported cause and rerun the same command with the same environment and
 placeholder values. A normal managed file without a committed baseline can be adopted
 when its bytes exactly match the current rendering. A differing normal managed file
-still conflicts unless a forced replacement is explicitly requested.
+still conflicts unless a forced replacement is explicitly requested. A differing
+environment-aware file stops install before any write, so deleting a stale
+package-managed file and rerunning install recreates it from the installed package.
 
 An existing create-only file can acquire a missing repair record when every required
 token resolves and its bytes exactly match the rendering. Local edits and existing
