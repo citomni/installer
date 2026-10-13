@@ -38,7 +38,9 @@ use CitOmni\Installer\Support\InstallerLock;
  * Dry runs do not acquire the lock or write any application files.
  *
  * Commands that maintain the installer block in .gitignore plan it from every
- * discovered manifest, also when --package narrows the scaffold files.
+ * discovered manifest, also when --package narrows the scaffold files. Create-only
+ * targets the application omits in config/citomni_installer.php are resolved against
+ * every discovered manifest as well, and are planned as `omitted`.
  *
  * Exit codes:
  * - 0: Every actionable file succeeded, or nothing needs changing.
@@ -153,6 +155,7 @@ abstract class AbstractWriteCommand {
 			$buildOptions['gitignore'] = $this->locator->gitignoreRules($discovered);
 		}
 		try {
+			$buildOptions['omit'] = $this->locator->omissions($discovered)['omitted'];
 			$plan = $this->builder->build($this->commandName(), $manifests, $placeholders, $buildOptions);
 		} catch (InstallerException $e) {
 			return $this->fail(

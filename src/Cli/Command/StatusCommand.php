@@ -32,6 +32,8 @@ use CitOmni\Installer\Support\ScaffoldManifestLocator;
  * status fails rather than guessing. Composer posture is inspected directly from
  * composer.json and never requires the Composer executable. The installer block in
  * .gitignore is always compared with every installed package, also with --package.
+ * Create-only targets the application omits in config/citomni_installer.php are
+ * reported as `omitted`, which is not a finding.
  */
 final class StatusCommand {
 
@@ -98,8 +100,21 @@ final class StatusCommand {
 			? $this->locator->selectEnvironment($manifests, $environment)
 			: $this->locator->selectEnvironmentAgnostic($manifests);
 
+		$hint = "\nHint: status renders managed stubs. Provide missing values via config/citomni_installer.php or --placeholder=KEY=VALUE.";
 		try {
 			$resolved = $this->placeholders->resolve($opt['placeholders']);
+		} catch (InstallerException $e) {
+			return $this->fail($format, $e->getMessage() . $hint, ExitCode::GENERAL_ERROR->value);
+		}
+
+		// An invalid omit list is a config error, not a rendering problem: no hint.
+		try {
+			$omitted = $discovered === [] ? [] : $this->locator->omissions($discovered)['omitted'];
+		} catch (InstallerException $e) {
+			return $this->fail($format, $e->getMessage(), ExitCode::GENERAL_ERROR->value);
+		}
+
+		try {
 			$placeholders = [];
 			foreach (\array_keys($manifests) as $pkgName) {
 				$placeholders[$pkgName] = $resolved;
@@ -107,14 +122,10 @@ final class StatusCommand {
 			// Without any scaffold manifest the installer maintains nothing, not even the block.
 			$plan = $this->builder->build('status', $manifests, $placeholders, $discovered === [] ? [] : [
 				'gitignore' => $this->locator->gitignoreRules($discovered),
+				'omit' => $omitted,
 			]);
 		} catch (InstallerException $e) {
-			return $this->fail(
-				$format,
-				$e->getMessage()
-					. "\nHint: status renders managed stubs. Provide missing values via config/citomni_installer.php or --placeholder=KEY=VALUE.",
-				ExitCode::GENERAL_ERROR->value
-			);
+			return $this->fail($format, $e->getMessage() . $hint, ExitCode::GENERAL_ERROR->value);
 		}
 
 		$composer = $environment instanceof Environment
@@ -194,7 +205,8 @@ final class StatusCommand {
 	 *
 	 * The .gitignore block counts like a file: a stale block, or a .gitignore missing in
 	 * a Git checkout, is drift; malformed markers are a conflict. A .gitignore missing
-	 * outside a Git checkout, or one the installer cannot maintain, is not a finding.
+	 * outside a Git checkout, or one the installer cannot maintain, is not a finding, and
+	 * neither is a create-only target the application omits.
 	 *
 	 * @param array<string,mixed> $plan Status plan.
 	 * @return int
@@ -212,7 +224,7 @@ final class StatusCommand {
 				$code = match ((string)($file['status'] ?? '')) {
 					'local_modified', 'unknown_existing', 'malformed' => ExitCode::CONFLICT->value,
 					'missing', 'update_available', 'placeholder_drift' => ExitCode::DRIFT->value,
-					'up_to_date', 'create_only_present', 'absent', 'unsupported' => ExitCode::OK->value,
+					'up_to_date', 'create_only_present', 'omitted', 'absent', 'unsupported' => ExitCode::OK->value,
 					default => -1,
 				};
 

@@ -39,7 +39,9 @@ use CitOmni\Installer\Support\ScaffoldManifestLocator;
  * keep their trusted managed baselines so local edits remain protected, while every
  * target is still re-evaluated against today's installed package sources. Create-only
  * code differences become freshly generated `.new` sidecars on every run. Template
- * targets remain authoritative. The installer block in .gitignore is refreshed, and a
+ * targets remain authoritative. Create-only targets the application omits in
+ * config/citomni_installer.php are skipped, and their stubs add no placeholder
+ * requirements or source warnings. The installer block in .gitignore is refreshed, and a
  * missing .gitignore is created in a Git checkout; malformed block markers stop
  * migration before writing. App-skeleton references and recursive PHP lint are
  * included in the human-review report.
@@ -117,8 +119,11 @@ final class MigrateCommand extends AbstractWriteCommand {
 				return $this->emptyResult($format, null);
 			}
 
-			$sourceWarnings = $this->diagnostics->inspectPercentStyleSourceTokens($discovered);
-			$configAudit = $this->diagnostics->inspectInstallerConfig($discovered, $environment, $opt['placeholders']);
+			// Omitted targets are never rendered, so their stubs must not demand placeholders.
+			$omitted = $this->locator->omissions($discovered)['omitted'];
+			$audited = $this->locator->withoutOmitted($discovered, $omitted);
+			$sourceWarnings = $this->diagnostics->inspectPercentStyleSourceTokens($audited);
+			$configAudit = $this->diagnostics->inspectInstallerConfig($audited, $environment, $opt['placeholders']);
 			$missing = (array)($configAudit['missing_effective_selected'] ?? []);
 			if ($missing !== []) {
 				$message = \sprintf(
@@ -161,6 +166,7 @@ final class MigrateCommand extends AbstractWriteCommand {
 				'migration_reconcile' => $reconcileCurrent,
 				'migration_environment_changed' => $environmentChanged,
 				'gitignore' => $this->locator->gitignoreRules($discovered),
+				'omit' => $omitted,
 			]);
 			$gitignoreExit = $this->failOnGitignoreConflict($plan, $format);
 			if ($gitignoreExit !== null) {

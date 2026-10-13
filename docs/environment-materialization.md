@@ -138,41 +138,35 @@ result. Unsafe recorded state uses exit 5; invalid command usage uses exit 2.
 
 Constructor changes for direct callers: ScaffoldState now takes PathGuard;
 AbstractWriteCommand and its concrete install/environment constructors also require
-InstallerLock. Prefer ScaffoldState::forAppRoot() and InstallerCli for normal usage.
+InstallerLock; ScaffoldManifestLocator also takes InstallerConfig, the source of the
+application's omit list. Prefer ScaffoldState::forAppRoot(),
+ScaffoldManifestLocator::forAppRoot() and InstallerCli for normal usage.
 
-## Regression tests
+## Tests
 
-The standalone suite requires PHP 8.5 or newer. It autoloads this checkout directly
-and creates disposable application fixtures; no Composer install is needed:
+The suites follow the CitOmni test convention: each one is a standalone PHP script
+without a test framework, and `tests/run.php` runs them all. They require PHP 8.5 or
+newer, autoload this checkout directly, and create disposable fixtures; no Composer
+install is needed:
 
 ```sh
-php tests/installer-regression-test.php
+php tests/run.php
 ```
 
-Most cases use a controlled Composer substitute to exercise failures deterministically.
-An optional integration case uses an actual Composer PHAR, verifies the generated
-autoloader's authoritative setting in a fresh PHP process for dev/stage/prod/dev, and
-checks that a root post-autoload-dump script did not run:
+The lifecycle suite covers environment materialization end to end. Most of its cases
+use a controlled Composer substitute to exercise failures deterministically, including
+a dev, stage, prod, dev cycle that checks dry runs, the recorded environment, the
+Composer posture, the rendered target, backups, and `status` after every switch. An
+optional case uses an actual Composer PHAR, verifies the generated autoloader's
+authoritative setting in a fresh PHP process for dev/stage/prod/dev, and checks that a
+root post-autoload-dump script did not run:
 
 ```sh
-php tests/installer-regression-test.php --composer=/absolute/path/to/composer.phar
+php tests/lifecycle/run.php --composer=/absolute/path/to/composer.phar
 ```
 
 The optional case isolates COMPOSER_HOME and runs only config and dump-autoload on
 local fixtures; it does not resolve or download dependencies. The selected PHAR must
-be runnable by the PHP binary executing the tests. Windows-specific and symlink
-checks report a skip when their platform/capability is unavailable. The check that a
-missing `.gitignore` stays absent outside a Git checkout skips when the system temp
-directory itself lies inside one.
-
-The application-level Windows test still runs from the disposable lab application:
-
-```bat
-cd /d C:\dev\www\citomni\_lab\environment-switch-e2e
-composer dump-autoload --no-scripts
-..\..\installer\tests\citomni-environment-end2end-test.bat
-```
-
-Refresh the application's autoload files after updating installer sources so newly
-added classes are available even if its prior autoloader was authoritative. The batch
-test reads each apply result's backup_dir and needs no sleep between switches.
+be runnable by the PHP binary executing the tests. Without `--composer`, and where the
+platform lacks a capability (Windows-only checks, symlinks, Unix modes), checks are
+reported as skipped; `tests/lifecycle/README.md` lists them with the expected totals.

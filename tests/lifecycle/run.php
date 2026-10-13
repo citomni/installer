@@ -13,47 +13,105 @@ declare(strict_types=1);
  * please see the LICENSE file distributed with this source code.
  */
 
+namespace CitOmni\Installer\Tests\Lifecycle;
+
 use CitOmni\Installer\Cli\InstallerCli;
 use CitOmni\Installer\Enum\Environment;
 use CitOmni\Installer\Exception\InstallerException;
 use CitOmni\Installer\Operation\ApplyEnvironmentMaterialization;
 use CitOmni\Installer\Operation\ApplyScaffoldPlan;
 use CitOmni\Installer\Operation\AuditAppSkeletonMigration;
-use CitOmni\Installer\Operation\BuildScaffoldPlan;
 use CitOmni\Installer\Operation\BuildMigrationDiagnostics;
+use CitOmni\Installer\Operation\BuildScaffoldPlan;
 use CitOmni\Installer\State\ScaffoldState;
 use CitOmni\Installer\Support\AtomicFileWriter;
 use CitOmni\Installer\Support\ComposerPackageDiscovery;
 use CitOmni\Installer\Support\ComposerRunner;
+use CitOmni\Installer\Support\InstallerConfig;
 use CitOmni\Installer\Support\InstallerLock;
 use CitOmni\Installer\Support\MigrationReportWriter;
-use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\PathGuard;
+use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\ScaffoldManifestLocator;
 use CitOmni\Installer\Support\ScaffoldRenderer;
 use CitOmni\Installer\Util\GitignoreBlock;
 use CitOmni\Installer\Util\Path;
 
+/*
+ * Standalone suite for the installer's command lifecycle.
+ *
+ * Every check builds disposable applications under one run directory and drives the
+ * real InstallerCli in a fresh child process (this script with --child), or the real
+ * operations in this process. A Composer substitute on PATH makes Composer failures
+ * deterministic. The run directory is removed afterwards; nothing else is touched.
+ *
+ * Usage:
+ *   php tests/lifecycle/run.php
+ *   php tests/lifecycle/run.php --composer=/path/to/composer.phar
+ *
+ * The real Composer check runs only with --composer.
+ */
+
+if (\PHP_SAPI !== 'cli') {
+	throw new \RuntimeException('CLI only.');
+}
+
 // Test-local autoloading exercises this checkout without installing or booting an app.
-spl_autoload_register(static function (string $class): void {
+\spl_autoload_register(static function (string $class): void {
 	$prefix = 'CitOmni\\Installer\\';
-	if (str_starts_with($class, $prefix)) {
-		require __DIR__ . '/../src/' . str_replace('\\', '/', substr($class, strlen($prefix))) . '.php';
+	if (\str_starts_with($class, $prefix)) {
+		require __DIR__ . '/../../src/' . \str_replace('\\', '/', \substr($class, \strlen($prefix))) . '.php';
 	}
 });
 
+// Child mode: the real CLI dispatcher in a fresh process, as bin/citomni-installer runs it.
 if (($argv[1] ?? '') === '--child') {
-	exit((new InstallerCli($argv[2]))->run(array_merge(['citomni-installer'], array_slice($argv, 3))));
+	exit((new InstallerCli($argv[2]))->run(\array_merge(['citomni-installer'], \array_slice($argv, 3))));
 }
-if (PHP_VERSION_ID < 80500) {
-	fwrite(STDERR, "PHP 8.5 or newer is required.\n");
+if (\PHP_VERSION_ID < 80500) {
+	\fwrite(\STDERR, "PHP 8.5 or newer is required.\n");
 	exit(1);
 }
+
+// Fail fast on every diagnostic; leave diagnostics silenced with @ to PHP. The installer
+// relies on @ for expected filesystem failures, and so do the capability probes below.
+\set_error_handler(static function (int $errno, string $errstr, string $errfile, int $errline): bool {
+	if ((\error_reporting() & $errno) === 0) {
+		return false;
+	}
+	throw new \ErrorException($errstr, 0, $errno, $errfile, $errline);
+});
+
+
+/**
+ * A failed expectation, reported as FAIL with its message.
+ */
+final class CheckFailed extends \RuntimeException {
+}
+
+
+/**
+ * A check this platform or run cannot perform, reported as SKIP with its reason.
+ */
+final class CheckSkipped extends \RuntimeException {
+}
+
+
+/** End the current check as skipped. */
+function skip(string $reason): never {
+	throw new CheckSkipped($reason);
+}
+
+/** Collapse line breaks, so a FAIL message stays on one line. */
+function oneLine(string $text): string {
+	return \trim((string)\preg_replace('/\s*\R\s*/', ' | ', $text));
+}
+
 
 /** Fail independently of PHP's zend.assertions setting. */
 function check(bool $condition, string $message): void {
 	if (!$condition) {
-		throw new RuntimeException($message);
+		throw new CheckFailed($message);
 	}
 }
 
@@ -64,7 +122,7 @@ function expectFailure(callable $run, string $message): void {
 	} catch (InstallerException) {
 		return;
 	}
-	throw new RuntimeException($message);
+	throw new CheckFailed($message);
 }
 
 /** Write test fixtures with their required parent directories. */
@@ -77,11 +135,16 @@ function put(string $path, string $bytes): void {
 
 /** Remove only this test run's owned tree; never follow directory symlinks. */
 function removeTree(string $path): void {
-	if (is_link($path) || !is_dir($path)) {
-		if (file_exists($path) || is_link($path)) {
-			if (!is_link($path)) {
-				@chmod($path, 0600);
-			}
+	if (is_link($path)) {
+		// Windows removes a link to a directory with rmdir(), any other link with unlink().
+		if (!@rmdir($path)) {
+			unlink($path);
+		}
+		return;
+	}
+	if (!is_dir($path)) {
+		if (file_exists($path)) {
+			@chmod($path, 0600);
 			unlink($path);
 		}
 		return;
@@ -92,6 +155,20 @@ function removeTree(string $path): void {
 		}
 	}
 	rmdir($path);
+}
+
+/**
+ * The PHP binary with this process's php.ini, so children run with the suite's settings.
+ *
+ * @return list<string>
+ */
+function php(): array {
+	static $command = null;
+	return $command ??= match (true) {
+		\php_ini_loaded_file() !== false   => [\PHP_BINARY, '-c', \php_ini_loaded_file()],
+		\php_ini_scanned_files() !== false => [\PHP_BINARY],
+		default                            => [\PHP_BINARY, '-n'],
+	};
 }
 
 /** Run a child with file-backed output so Windows pipe buffering cannot stall tests. */
@@ -115,7 +192,7 @@ function command(string $app, array $args, bool $json = true): array {
 	if ($json) {
 		$args[] = '--format=json';
 	}
-	[$exit, $out, $err] = child(array_merge([PHP_BINARY, __FILE__, '--child', $app], $args), $app);
+	[$exit, $out, $err] = child(array_merge(php(), [__FILE__, '--child', $app], $args), $app);
 	$payload = $json ? json_decode($out, true) : null;
 	if ($json) {
 		check(is_array($payload), 'Expected JSON response. Output was ' . $out . $err);
@@ -196,10 +273,11 @@ function resultFile(array $result, string $target): array {
 			}
 		}
 	}
-	throw new RuntimeException('Result did not contain target ' . $target);
+	throw new CheckFailed('Result did not contain target ' . $target);
 }
 
-$base = sys_get_temp_dir() . '/citomni-installer-regression-' . bin2hex(random_bytes(8));
+// Every fixture lives below this run directory, which is removed after the run.
+$base = sys_get_temp_dir() . '/citomni_installer_lifecycle_' . bin2hex(random_bytes(8));
 mkdir($base);
 $savedEnvironment = [];
 foreach (['PATH', 'COMPOSER', 'COMPOSER_VENDOR_DIR'] as $key) {
@@ -330,18 +408,19 @@ $tests['global target collisions fail even behind a package filter'] = static fu
 	[$exit] = command($app, ['install', '--environment=dev']);
 	check($exit !== 0 && !is_file($app . '/bin/tool'), 'Collision wrote a target.');
 };
-$tests['target aliases and file/directory overlaps fail before apply'] = static function () use ($base): void {
+$tests['file/directory overlaps between packages fail before apply'] = static function () use ($base): void {
 	$app = fixture($base, 'parent-collision');
 	package($app, 'test/other', [['target' => 'bin', 'source' => 'install/other.stub', 'type' => 'text', 'policy' => 'managed']], ['install/other.stub' => 'other']);
 	expectFailure(fn() => ScaffoldManifestLocator::forAppRoot($app)->discover(), 'File/directory collision was accepted.');
+};
+$tests['target aliases through a symlinked directory fail before apply'] = static function () use ($base): void {
 	$app = fixture($base, 'alias-collision');
 	mkdir($app . '/bin');
-	if (@symlink($app . '/bin', $app . '/alias')) {
-		package($app, 'test/other', [['target' => 'alias/tool', 'source' => 'install/other.stub', 'type' => 'text', 'policy' => 'managed']], ['install/other.stub' => 'other']);
-		expectFailure(fn() => ScaffoldManifestLocator::forAppRoot($app)->discover(), 'Symlink alias collision was accepted.');
-	} else {
-		echo "  SKIP Symlink alias check (creation unavailable).\n";
+	if (!@symlink($app . '/bin', $app . '/alias')) {
+		skip('symlink creation is unavailable');
 	}
+	package($app, 'test/other', [['target' => 'alias/tool', 'source' => 'install/other.stub', 'type' => 'text', 'policy' => 'managed']], ['install/other.stub' => 'other']);
+	expectFailure(fn() => ScaffoldManifestLocator::forAppRoot($app)->discover(), 'Symlink alias collision was accepted.');
 };
 $tests['installer metadata is reserved without excluding other app state'] = static function () use ($base): void {
 	foreach ([ScaffoldState::RELATIVE_PATH, InstallerLock::RELATIVE_PATH, 'var/backups/citomni-installer/file', 'var/state'] as $index => $target) {
@@ -352,15 +431,17 @@ $tests['installer metadata is reserved without excluding other app state'] = sta
 	$app = fixture($base, 'unreserved');
 	package($app, 'test/other', [['target' => 'var/state/citomni/other.php', 'source' => 'install/other.stub', 'type' => 'text', 'policy' => 'managed']], ['install/other.stub' => 'other']);
 	check(count(ScaffoldManifestLocator::forAppRoot($app)->discover()) === 2, 'Unrelated application state was reserved.');
-	mkdir($app . '/var/state/citomni', 0775, true);
-	if (@symlink($app . '/var/state/citomni', $app . '/state-alias')) {
-		package($app, 'test/alias', [['target' => 'state-alias/installer.lock', 'source' => 'install/other.stub', 'type' => 'text', 'policy' => 'managed']], ['install/other.stub' => 'other']);
-		expectFailure(fn() => ScaffoldManifestLocator::forAppRoot($app)->discover(), 'Metadata alias was accepted as scaffold.');
-	} else {
-		echo "  SKIP Metadata alias check (symlink creation unavailable).\n";
-	}
 };
-$tests['target containment protects vendor and handles Windows case explicitly'] = static function () use ($base): void {
+$tests['installer metadata stays reserved behind a symlinked alias'] = static function () use ($base): void {
+	$app = fixture($base, 'reserved-alias');
+	mkdir($app . '/var/state/citomni', 0775, true);
+	if (!@symlink($app . '/var/state/citomni', $app . '/state-alias')) {
+		skip('symlink creation is unavailable');
+	}
+	package($app, 'test/alias', [['target' => 'state-alias/installer.lock', 'source' => 'install/other.stub', 'type' => 'text', 'policy' => 'managed']], ['install/other.stub' => 'other']);
+	expectFailure(fn() => ScaffoldManifestLocator::forAppRoot($app)->discover(), 'Metadata alias was accepted as scaffold.');
+};
+$tests['target containment protects vendor and folds case only when asked'] = static function () use ($base): void {
 	check(Path::isInside('C:/App/vendor', 'c:/APP/VENDOR/pkg/file', true), 'Windows path case was not folded.');
 	check(!Path::isInside('C:/App/vendor', 'C:/App/vendor-other', true), 'Path boundary was lost.');
 	check(!Path::isInside('/app/vendor', '/app/VENDOR/pkg', false), 'Case-sensitive path identity was lost.');
@@ -368,17 +449,22 @@ $tests['target containment protects vendor and handles Windows case explicitly']
 	$guard = new PathGuard($app);
 	expectFailure(fn() => $guard->resolveTarget('vendor/test/core/file'), 'Vendor target was accepted.');
 	check(is_file($guard->resolveSource($app . '/vendor/test/core', 'install/tool.stub')), 'Vendor source was rejected.');
-	if (@symlink($app . '/vendor/test', $app . '/vendor-alias')) {
-		expectFailure(fn() => $guard->resolveTarget('vendor-alias/core/file'), 'Vendor alias target was accepted.');
-	} else {
-		echo "  SKIP Vendor alias check (symlink creation unavailable).\n";
+};
+$tests['a symlinked alias of vendor is rejected as a target'] = static function () use ($base): void {
+	$app = fixture($base, 'vendor-alias');
+	if (!@symlink($app . '/vendor/test', $app . '/vendor-alias')) {
+		skip('symlink creation is unavailable');
 	}
-	if (PHP_OS_FAMILY === 'Windows') {
-		package($app, 'test/other', [['target' => 'BIN/TOOL', 'source' => 'install/other.stub', 'type' => 'text', 'policy' => 'managed']], ['install/other.stub' => 'other']);
-		expectFailure(fn() => ScaffoldManifestLocator::forAppRoot($app)->discover(), 'Windows case alias collision was accepted.');
-	} else {
-		echo "  SKIP Windows filesystem case-collision check.\n";
+	$guard = new PathGuard($app);
+	expectFailure(fn() => $guard->resolveTarget('vendor-alias/core/file'), 'Vendor alias target was accepted.');
+};
+$tests['targets differing only in case collide on Windows'] = static function () use ($base): void {
+	if (PHP_OS_FAMILY !== 'Windows') {
+		skip('Windows only');
 	}
+	$app = fixture($base, 'case-collision');
+	package($app, 'test/other', [['target' => 'BIN/TOOL', 'source' => 'install/other.stub', 'type' => 'text', 'policy' => 'managed']], ['install/other.stub' => 'other']);
+	expectFailure(fn() => ScaffoldManifestLocator::forAppRoot($app)->discover(), 'Windows case alias collision was accepted.');
 };
 $tests['stale update and stale creation preserve intervening changes'] = static function () use ($base): void {
 	$app = fixture($base, 'stale');
@@ -423,7 +509,7 @@ $tests['root URL placeholders reject trailing slashes'] = static function () use
 	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['PROD_ROOT_URL' => 'https://www.example.test/']];");
 	try {
 		(new PlaceholderResolver($app))->resolve();
-		throw new RuntimeException('Trailing slash in PROD_ROOT_URL was accepted.');
+		throw new CheckFailed('Trailing slash in PROD_ROOT_URL was accepted.');
 	} catch (InstallerException $e) {
 		check(
 			$e->getMessage() === 'Placeholder {{PROD_ROOT_URL}} in installer config must not end with "/". Remove the trailing slash and retry.',
@@ -434,7 +520,7 @@ $tests['root URL placeholders reject trailing slashes'] = static function () use
 	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['STAGE_ROOT_URL' => 'https://stage.example.test/']];");
 	try {
 		(new PlaceholderResolver($app))->resolve();
-		throw new RuntimeException('Trailing slash in STAGE_ROOT_URL was accepted.');
+		throw new CheckFailed('Trailing slash in STAGE_ROOT_URL was accepted.');
 	} catch (InstallerException $e) {
 		check(
 			$e->getMessage() === 'Placeholder {{STAGE_ROOT_URL}} in installer config must not end with "/". Remove the trailing slash and retry.',
@@ -445,7 +531,7 @@ $tests['root URL placeholders reject trailing slashes'] = static function () use
 	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['PROD_ROOT_URL' => 'https://www.example.test', 'STAGE_ROOT_URL' => 'https://stage.example.test']];");
 	try {
 		(new PlaceholderResolver($app))->resolve(['PROD_ROOT_URL' => 'https://override.example.test/']);
-		throw new RuntimeException('Trailing slash in CLI PROD_ROOT_URL override was accepted.');
+		throw new CheckFailed('Trailing slash in CLI PROD_ROOT_URL override was accepted.');
 	} catch (InstallerException $e) {
 		check(
 			$e->getMessage() === 'Placeholder {{PROD_ROOT_URL}} in CLI overrides must not end with "/". Remove the trailing slash and retry.',
@@ -525,6 +611,40 @@ $tests['dry run writes neither scaffold state nor lock and prints Composer plan'
 	check(!is_file($app . '/bin/tool') && !is_dir($app . '/var'), 'Dry-run created scaffold, state or lock metadata.');
 	check(file_get_contents($app . '/composer.json') === $composer, 'Dry-run changed composer.json.');
 };
+$tests['switching dev, stage, prod and back keeps state, Composer posture, status and backups in step'] = static function () use ($base): void {
+	$app = fixture($base, 'environment-cycle');
+	// One environment source with a placeholder, so a switch must render, not copy.
+	put($app . '/vendor/test/core/install/prod.stub', "prod {{APP_NAME}}\n");
+	$rendered = ['dev' => "dev\n", 'stage' => "stage\n", 'prod' => "prod fixture\n"];
+	$state = installed($app);
+	$target = $app . '/public/environment.txt';
+	$authoritative = static fn(): mixed => json_decode(file_get_contents($app . '/composer.json'), true)['config']['classmap-authoritative'] ?? null;
+
+	$previous = 'dev';
+	foreach (['stage', 'prod', 'dev'] as $next) {
+		$posture = Environment::from($next)->classmapAuthoritative();
+
+		// A dry run plans the switch and changes nothing.
+		$before = [file_get_contents($state->path()), file_get_contents($app . '/composer.json'), file_get_contents($target)];
+		[$exit, $dry, $output] = command($app, ['environment', $next, '--dry-run']);
+		check($exit === 0 && ($dry['dry_run'] ?? null) === true && ($dry['environment'] ?? null) === $next, "Dry-run switch to {$next} failed. " . $output);
+		check(resultFile($dry, 'public/environment.txt')['action'] === 'update', "Dry-run switch to {$next} planned no update of the environment target.");
+		check(($dry['composer']['classmap_authoritative'] ?? null) === $posture && ($dry['composer']['applied'] ?? null) === false, "Dry-run switch to {$next} planned the wrong Composer posture.");
+		check([file_get_contents($state->path()), file_get_contents($app . '/composer.json'), file_get_contents($target)] === $before, "Dry-run switch to {$next} changed state, composer.json or a target.");
+		check(!is_dir((string)($dry['backup_dir'] ?? '')), "Dry-run switch to {$next} created its planned backup directory.");
+
+		[$exit, $result, $output] = command($app, ['environment', $next]);
+		check($exit === 0, "Switch to {$next} failed. " . $output);
+		check($state->environment() === Environment::from($next), "Switch to {$next} recorded the wrong environment.");
+		check($authoritative() === $posture, "Switch to {$next} left the wrong classmap-authoritative posture.");
+		check(file_get_contents($target) === $rendered[$next], "Switch to {$next} did not render the {$next} source.");
+		check(is_string($result['backup_dir'] ?? null) && file_get_contents($result['backup_dir'] . '/public/environment.txt') === $rendered[$previous], "The backup of the switch to {$next} lacks the {$previous} bytes.");
+
+		[$exit, , $output] = command($app, ['status']);
+		check($exit === 0, "Status after the switch to {$next} is not clean. " . $output);
+		$previous = $next;
+	}
+};
 $tests['failed environment switch retains old state and is recoverable'] = static function () use ($base): void {
 	$app = fixture($base, 'switch-recovery');
 	$state = installed($app);
@@ -538,14 +658,38 @@ $tests['failed environment switch retains old state and is recoverable'] = stati
 	check($exit === 0 && $state->environment() === Environment::PROD, 'Environment retry failed.');
 	check($result['backup_dir'] === null, 'Retry backed up already-correct files.');
 };
+$tests['bin/citomni-installer runs from the application root through a Composer proxy'] = static function () use ($base): void {
+	$app = fixture($base, 'bin-proxy');
+	$src = (string)realpath(__DIR__ . '/../../src');
+	$bin = (string)realpath(__DIR__ . '/../../bin/citomni-installer');
+
+	// The autoloader the proxy announces: this checkout's sources, as Composer would map them.
+	put($app . '/vendor/installer-autoload.php', "<?php\n(static function (string \$src): void {\n" . <<<'PHP'
+	spl_autoload_register(static function (string $class) use ($src): void {
+		$prefix = 'CitOmni\\Installer\\';
+		if (str_starts_with($class, $prefix)) {
+			require $src . '/' . str_replace('\\', '/', substr($class, strlen($prefix))) . '.php';
+		}
+	});
+PHP . "\n})(" . var_export($src, true) . ");\n");
+	// The PHP proxy Composer 2 writes to vendor/bin; vendor\bin\*.bat runs the same file.
+	put($app . '/vendor/bin/citomni-installer', "<?php\n\$GLOBALS['_composer_bin_dir'] = __DIR__;\n\$GLOBALS['_composer_autoload_path'] = __DIR__ . '/../installer-autoload.php';\nreturn include " . var_export($bin, true) . ";\n");
+
+	[$exit, $out, $err] = child([...php(), $app . '/vendor/bin/citomni-installer', 'install', '--environment=dev', '--format=json'], $app);
+	$result = json_decode($out, true);
+	check($exit === 0 && ($result['ok'] ?? null) === true, 'The bin script did not install through the proxy. ' . $out . $err);
+	check(is_file($app . '/bin/tool') && ScaffoldState::forAppRoot($app)->environment() === Environment::DEV, 'The bin script did not materialize the application it was run from.');
+
+	[$exit, , $err] = child([...php(), $app . '/vendor/bin/citomni-installer', 'status'], $app . '/config');
+	check($exit === 6 && str_contains($err, 'Not a project root'), 'The bin script accepted a working directory without composer.json. ' . $err);
+};
 $tests['unsafe state paths fail and doctor reports write-access failure'] = static function () use ($base): void {
 	$app = fixture($base, 'state-symlink');
 	mkdir($app . '/var', 0775, true);
 	$outside = $base . '/external-state';
 	mkdir($outside);
 	if (!@symlink($outside, $app . '/var/state')) {
-		echo "  SKIP State symlink check (creation unavailable).\n";
-		return;
+		skip('symlink creation is unavailable');
 	}
 	expectFailure(fn() => ScaffoldState::forAppRoot($app)->writePackagesAndEnvironment([], Environment::DEV), 'State escaped application root.');
 	[$exit, $result] = command($app, ['doctor']);
@@ -556,8 +700,7 @@ $tests['unsafe state paths fail and doctor reports write-access failure'] = stat
 };
 $tests['atomic replacement preserves restrictive and executable Unix modes'] = static function () use ($base): void {
 	if (PHP_OS_FAMILY === 'Windows') {
-		echo "  SKIP Unix permission check (Windows).\n";
-		return;
+		skip('Unix permission bits do not apply on Windows');
 	}
 	foreach ([0600, 0755] as $mode) {
 		$path = $base . '/mode-' . $mode;
@@ -1223,8 +1366,7 @@ $tests['unsupported gitignore files never break commands'] = static function () 
 	$outside = $base . '/shared-gitignore';
 	put($outside, "/shared/\n");
 	if (!@symlink($outside, $app . '/.gitignore')) {
-		echo "  SKIP Unsupported .gitignore check (symlink creation unavailable).\n";
-		return;
+		skip('symlink creation is unavailable');
 	}
 
 	[$exit, $result, $output] = command($app, ['install', '--environment=dev']);
@@ -1235,13 +1377,23 @@ $tests['unsupported gitignore files never break commands'] = static function () 
 	}
 	check(file_get_contents($outside) === "/shared/\n", 'The installer wrote through a symlink leaving the application.');
 
+	// Windows creates a link only to an existing target, so remove the target afterwards.
 	unlink($app . '/.gitignore');
+	put($base . '/missing-gitignore', "/gone/\n");
 	symlink($base . '/missing-gitignore', $app . '/.gitignore');
+	unlink($base . '/missing-gitignore');
 	[$exit, $status] = command($app, ['status']);
 	check($exit === 0 && ($status['gitignore']['status'] ?? null) === 'unsupported', 'A dangling .gitignore symlink broke status.');
 	unlink($app . '/.gitignore');
 	put($app . '/config/gitignore', "# Application rules\n");
-	symlink('config/gitignore', $app . '/.gitignore');
+	// Windows checks a relative target against the current directory, not the link's.
+	$cwd = (string)getcwd();
+	chdir($app);
+	try {
+		symlink('config/gitignore', '.gitignore');
+	} finally {
+		chdir($cwd);
+	}
 	[$exit, $status] = command($app, ['status']);
 	check($exit === 0 && ($status['gitignore']['reason'] ?? null) === 'gitignore_symlink', 'A symlinked .gitignore inside the application was not reported as unsupported.');
 	[$exit, $result] = command($app, ['sync']);
@@ -1305,13 +1457,13 @@ $tests['a manifest with only gitignore rules adds its block without scaffold fil
 };
 
 $tests['the installer manifest is validated together with package rules'] = static function () use ($base): void {
-	$manifest = require __DIR__ . '/../install/manifest.php';
+	$manifest = require __DIR__ . '/../../install/manifest.php';
 	check(($manifest['package'] ?? null) === 'citomni/installer' && ($manifest['files'] ?? null) === [], 'The installer manifest must declare runtime rules and no scaffold files.');
 
 	$app = fixture($base, 'gitignore-installer-manifest');
 	$path = $app . '/vendor/composer/installed.json';
 	$data = json_decode(file_get_contents($path), true);
-	$data['packages'][] = ['name' => 'citomni/installer', 'version' => '1.0.0', 'install-path' => realpath(__DIR__ . '/..')];
+	$data['packages'][] = ['name' => 'citomni/installer', 'version' => '1.0.0', 'install-path' => realpath(__DIR__ . '/../..')];
 	put($path, json_encode($data));
 	package($app, 'test/web', [], [], ['/var/secrets/*', '/var/state/*', '!/var/secrets/.gitkeep', '!/var/secrets/web.secret.php.tpl', '!/var/state/.gitkeep']);
 
@@ -1379,8 +1531,7 @@ $tests['a missing gitignore stays absent outside a Git checkout'] = static funct
 	$app = fixture($base, 'gitignore-no-checkout');
 	for ($directory = (string)realpath($app); ; $directory = dirname($directory)) {
 		if (file_exists($directory . '/.git')) {
-			echo "  SKIP Missing .gitignore outside a Git checkout (the temp directory is inside one).\n";
-			return;
+			skip('the system temp directory lies inside a Git checkout');
 		}
 		if (dirname($directory) === $directory) {
 			break;
@@ -1414,80 +1565,340 @@ $tests['the installer block follows a leading app-skeleton block'] = static func
 };
 
 
+$tests['omitted create-only targets are never created, recorded or rewritten'] = static function () use ($base): void {
+	$app = fixture($base, 'omit-create-only');
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['APP_NAME' => 'fixture'], 'omit' => ['./config/app.php', 'config/app.php']];");
+	check((new InstallerConfig($app))->omitList() === ['config/app.php'], 'Omit entries were not normalized and deduplicated.');
+
+	[$exit, $result, $output] = command($app, ['install', '--environment=dev']);
+	check($exit === 0, 'Install with an omitted target failed. ' . $output);
+	$file = resultFile($result, 'config/app.php');
+	check($file['status'] === 'omitted' && $file['reason'] === 'listed_in_omit' && $file['applied'] === 'skipped', 'Install did not report the omitted target.');
+	check(!is_file($app . '/config/app.php'), 'Install created an omitted target.');
+	check(!isset(ScaffoldState::forAppRoot($app)->readPackages()['test/core']['files']['config/app.php']), 'Install recorded an omitted target in state.');
+	check(is_file($app . '/bin/tool'), 'Omitting one target suppressed the others.');
+
+	[$exit, $result] = command($app, ['status']);
+	check($exit === 0 && resultFile($result, 'config/app.php')['status'] === 'omitted', 'Status treated an omitted target as a finding.');
+
+	foreach ([['sync'], ['repair'], ['sync', 'config/app.php']] as $args) {
+		[$exit, , $output] = command($app, $args);
+		check($exit === 0 && !is_file($app . '/config/app.php'), implode(' ', $args) . ' created an omitted target. ' . $output);
+	}
+
+	// A positional target scopes omitted entries like any other.
+	[$exit, $result] = command($app, ['sync', 'config/app.php']);
+	check($exit === 0 && resultFile($result, 'config/app.php')['status'] === 'omitted', 'A positional omitted target was not reported as omitted.');
+	[$exit, $result] = command($app, ['sync', 'bin/tool']);
+	$targets = [];
+	foreach ($result['packages'] ?? [] as $pkg) {
+		foreach ($pkg['files'] as $file) {
+			$targets[] = $file['target'];
+		}
+	}
+	check($exit === 0 && $targets === ['bin/tool'], 'Another positional target still listed the omitted target: ' . json_encode($targets));
+
+	// An existing omitted file belongs to the application: neither force nor migrate touches it.
+	$local = "<?php return ['local' => true];\n";
+	put($app . '/config/app.php', $local);
+	[$exit, , $output] = command($app, ['sync', '--force=yes']);
+	check($exit === 0 && file_get_contents($app . '/config/app.php') === $local, 'Forced sync rewrote an omitted target. ' . $output);
+	[$exit, $result, $output] = command($app, ['migrate']);
+	check($exit === 0 && resultFile($result, 'config/app.php')['status'] === 'omitted', 'Migrate did not skip an omitted target. ' . $output);
+	check(file_get_contents($app . '/config/app.php') === $local && !is_file($app . '/config/app.php.new'), 'Migrate rewrote or reviewed an omitted target.');
+
+	// Dropping the entry restores ordinary create-only behavior.
+	unlink($app . '/config/app.php');
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['APP_NAME' => 'fixture']];");
+	[$exit, , $output] = command($app, ['sync']);
+	check($exit === 0 && file_get_contents($app . '/config/app.php') === "<?php return ['name' => 'fixture'];\n", 'Removing the omit entry did not restore creation. ' . $output);
+};
+$tests['omit accepts only create-only targets and valid paths'] = static function () use ($base): void {
+	$cases = [
+		'managed target' => ["['bin/tool']", 'Only create-only targets can be omitted'],
+		'environment-aware target' => ["['public/environment.txt']", 'Only create-only targets can be omitted'],
+		'not a list' => ["'config/app.php'", 'omit entry must be a list'],
+		'not a string' => ['[42]', 'expected an app-relative path, got int'],
+		'traversal' => ["['../config/app.php']", 'Invalid omit entry'],
+		'absolute path' => ["['/config/app.php']", 'Invalid omit entry'],
+		'backslash' => ["['config\\\\app.php']", 'Invalid omit entry'],
+	];
+
+	$fresh = fixture($base, 'omit-invalid-fresh');
+	put($fresh . '/config/citomni_installer.php', "<?php return ['placeholders' => ['APP_NAME' => 'fixture'], 'omit' => ['bin/tool']];");
+	[$exit, $result] = command($fresh, ['install', '--environment=dev']);
+	check($exit === 1 && str_contains((string)($result['error'] ?? ''), 'which test/core manages'), 'Install accepted an omitted managed target.');
+	check(!is_file($fresh . '/bin/tool') && !ScaffoldState::forAppRoot($fresh)->exists(), 'A rejected omit list still materialized scaffold or state.');
+
+	$app = fixture($base, 'omit-invalid');
+	installed($app);
+	$tool = file_get_contents($app . '/bin/tool');
+	foreach ($cases as $name => [$omit, $message]) {
+		put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['APP_NAME' => 'fixture'], 'omit' => {$omit}];");
+		foreach ([['status'], ['sync'], ['repair'], ['migrate']] as $args) {
+			[$exit, $result] = command($app, $args);
+			check($exit === 1 && str_contains((string)($result['error'] ?? ''), $message), $args[0] . ' accepted an invalid omit list (' . $name . '): ' . json_encode($result));
+		}
+		[$exit, $result] = command($app, ['doctor']);
+		$checks = array_column($result['checks'] ?? [], null, 'name');
+		check($exit === 1 && ($checks['omitted_targets']['status'] ?? null) === 'fail', 'Doctor did not fail an invalid omit list (' . $name . ').');
+	}
+	check(file_get_contents($app . '/bin/tool') === $tool, 'A rejected omit list changed a managed file.');
+};
+$tests['unmatched omit entries have no effect and doctor warns about them'] = static function () use ($base): void {
+	$app = fixture($base, 'omit-unmatched');
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['APP_NAME' => 'fixture'], 'omit' => ['config/gone.php', 'config/app.php']];");
+
+	[$exit, , $output] = command($app, ['install', '--environment=dev']);
+	check($exit === 0 && !is_file($app . '/config/app.php'), 'An unmatched entry broke install or the matched omission. ' . $output);
+	[$exit] = command($app, ['status']);
+	check($exit === 0, 'Status treated an unmatched omit entry as a finding.');
+
+	[$exit, $result] = command($app, ['doctor']);
+	$checks = array_column($result['checks'] ?? [], null, 'name');
+	$detail = (string)($checks['omitted_targets']['detail'] ?? '');
+	check($exit === 0 && ($checks['omitted_targets']['status'] ?? null) === 'warn', 'Doctor did not warn about an unmatched omit entry.');
+	check(str_contains($detail, 'Omitted: config/app.php.') && str_contains($detail, 'no effect: config/gone.php.'), 'Doctor did not name the omitted and unmatched entries: ' . $detail);
+};
+$tests['omitted stubs demand no placeholders from install or migrate'] = static function () use ($base): void {
+	$extra = static function (string $app): void {
+		package($app, 'test/extra', [
+			['target' => 'config/extra.php', 'source' => 'install/extra.stub', 'type' => 'config', 'policy' => 'create-only'],
+		], ['install/extra.stub' => "<?php return ['x' => '{{MISSING_NAME}}'];\n"]);
+	};
+
+	$app = fixture($base, 'omit-placeholders-install');
+	$extra($app);
+	[$exit] = command($app, ['install', '--environment=dev']);
+	check($exit !== 0, 'Precondition: the unresolved token did not stop install.');
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['APP_NAME' => 'fixture'], 'omit' => ['config/extra.php']];");
+	[$exit, , $output] = command($app, ['install', '--environment=dev']);
+	check($exit === 0 && !is_file($app . '/config/extra.php'), 'Install rendered an omitted stub. ' . $output);
+
+	$app = fixture($base, 'omit-placeholders-migrate');
+	$extra($app);
+	[$exit, $result] = command($app, ['migrate']);
+	check($exit === 1 && str_contains((string)($result['error'] ?? ''), 'MISSING_NAME'), 'Precondition: the unresolved token did not stop migrate.');
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['APP_NAME' => 'fixture'], 'omit' => ['config/extra.php']];");
+	[$exit, $result, $output] = command($app, ['migrate']);
+	check($exit === 0 && !is_file($app . '/config/extra.php'), 'Migrate still required the placeholder of an omitted stub. ' . $output);
+	$requirements = (array)($result['migration']['installer_config']['requirements']['dev'] ?? []);
+	check(!isset($requirements['MISSING_NAME']), 'Migration diagnostics counted the placeholders of an omitted stub.');
+};
+
+$tests['an omitted target stays absent when state records it'] = static function () use ($base): void {
+	// Control: without omit, a recorded create-only target is recreated.
+	$control = fixture($base, 'omit-recorded-control');
+	installed($control);
+	unlink($control . '/config/app.php');
+	[$exit, , $output] = command($control, ['repair']);
+	check($exit === 0 && is_file($control . '/config/app.php'), 'Precondition: repair did not recreate a recorded create-only target. ' . $output);
+
+	$app = fixture($base, 'omit-recorded');
+	installed($app);
+	$record = ScaffoldState::forAppRoot($app)->readPackages()['test/core']['files']['config/app.php'] ?? null;
+	check(is_array($record), 'Precondition: install did not record the create-only target.');
+	unlink($app . '/config/app.php');
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['APP_NAME' => 'fixture'], 'omit' => ['config/app.php']];");
+
+	foreach ([['repair'], ['sync'], ['sync', '--force=yes'], ['install', '--environment=dev']] as $args) {
+		[$exit, , $output] = command($app, $args);
+		check($exit === 0 && !is_file($app . '/config/app.php'), implode(' ', $args) . ' recreated an omitted target that state records. ' . $output);
+	}
+	check((ScaffoldState::forAppRoot($app)->readPackages()['test/core']['files']['config/app.php'] ?? null) === $record, 'The state record of an omitted target was refreshed or dropped.');
+};
+$tests['omit is resolved against every package, also behind --package'] = static function () use ($base): void {
+	$app = fixture($base, 'omit-package-filter');
+	package($app, 'test/extra', [
+		['target' => 'config/extra.php', 'source' => 'install/extra.stub', 'type' => 'config', 'policy' => 'create-only'],
+	], ['install/extra.stub' => "<?php return [];\n"]);
+	installed($app);
+
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['APP_NAME' => 'fixture'], 'omit' => ['bin/tool']];");
+	foreach ([['status'], ['sync'], ['repair'], ['install', '--environment=dev']] as $args) {
+		$args[] = '--package=test/extra';
+		[$exit, $result] = command($app, $args);
+		check($exit === 1 && str_contains((string)($result['error'] ?? ''), 'which test/core manages'), implode(' ', $args) . ' accepted an omitted managed target of another package: ' . json_encode($result));
+	}
+	[$exit, $result] = command($app, ['doctor', '--package=test/extra']);
+	$checks = array_column($result['checks'] ?? [], null, 'name');
+	check($exit === 1 && ($checks['omitted_targets']['status'] ?? null) === 'fail', 'Doctor --package missed an omitted managed target of another package.');
+
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['APP_NAME' => 'fixture'], 'omit' => ['config/app.php']];");
+	[$exit, $result] = command($app, ['doctor', '--package=test/extra']);
+	$checks = array_column($result['checks'] ?? [], null, 'name');
+	check($exit === 0 && ($checks['omitted_targets']['status'] ?? null) === 'ok' && ($checks['omitted_targets']['detail'] ?? null) === 'Omitted: config/app.php.', 'Doctor --package misreported the omitted target of another package: ' . json_encode($checks['omitted_targets'] ?? null));
+};
+$tests['migrate ignores percent-style tokens in omitted stubs'] = static function () use ($base): void {
+	$app = fixture($base, 'omit-source-warning');
+	installed($app);
+	put($app . '/vendor/test/core/install/config.stub', "<?php\n// %LEGACY_TOKEN%\nreturn ['name' => '{{APP_NAME}}'];\n");
+	[$exit, $result, $output] = command($app, ['migrate', '--dry-run']);
+	check($exit === 0 && ($result['migration']['scaffold_source_warnings']['file_count'] ?? 0) === 1, 'Precondition: migrate did not warn about the token. ' . $output);
+
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['APP_NAME' => 'fixture'], 'omit' => ['config/app.php']];");
+	[$exit, $result, $output] = command($app, ['migrate', '--dry-run']);
+	check($exit === 0 && ($result['migration']['scaffold_source_warnings']['file_count'] ?? 0) === 0, 'Migrate warned about a token in an omitted stub. ' . $output);
+};
+$tests['omit keeps numeric-looking targets as strings'] = static function () use ($base): void {
+	$app = fixture($base, 'omit-numeric');
+	package($app, 'test/numeric', [
+		['target' => '123', 'source' => 'install/numeric.stub', 'type' => 'text', 'policy' => 'create-only'],
+	], ['install/numeric.stub' => "numeric\n"]);
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['APP_NAME' => 'fixture'], 'omit' => ['456', './123', '123']];");
+	check((new InstallerConfig($app))->omitList() === ['123', '456'], 'Numeric-looking omit entries lost their string type.');
+	$locator = ScaffoldManifestLocator::forAppRoot($app);
+	check($locator->omissions($locator->discover()) === ['omitted' => ['123'], 'unmatched' => ['456']], 'Numeric-looking targets lost their string type in omissions().');
+
+	[$exit, $result, $output] = command($app, ['install', '--environment=dev']);
+	check($exit === 0 && !is_file($app . '/123') && resultFile($result, '123')['status'] === 'omitted', 'A numeric-looking omitted target was created. ' . $output);
+};
+$tests['omit folds case on Windows only'] = static function () use ($base): void {
+	$app = fixture($base, 'omit-case');
+	put($app . '/config/citomni_installer.php', "<?php return ['placeholders' => ['APP_NAME' => 'fixture'], 'omit' => ['CONFIG/App.php']];");
+	$locator = ScaffoldManifestLocator::forAppRoot($app);
+	$omissions = $locator->omissions($locator->discover());
+	if (PHP_OS_FAMILY === 'Windows') {
+		check($omissions === ['omitted' => ['config/app.php'], 'unmatched' => []], 'Windows did not fold the case of an omit entry.');
+		[$exit, , $output] = command($app, ['install', '--environment=dev']);
+		check($exit === 0 && !is_file($app . '/config/app.php'), 'Windows created a case-folded omitted target. ' . $output);
+	} else {
+		check($omissions === ['omitted' => [], 'unmatched' => ['CONFIG/App.php']], 'A case-sensitive platform folded the case of an omit entry.');
+	}
+};
+$tests['the installer config is evaluated once per command'] = static function () use ($base): void {
+	$app = fixture($base, 'omit-config-once');
+	// A second evaluation would redeclare the function (fatal) and the constant (warning in the JSON).
+	put($app . '/config/citomni_installer.php', "<?php\nfunction citomni_installer_test_name(): string { return 'fixture'; }\ndefine('CITOMNI_INSTALLER_TEST_OMIT', 'config/app.php');\nreturn ['placeholders' => ['APP_NAME' => citomni_installer_test_name()], 'omit' => [CITOMNI_INSTALLER_TEST_OMIT]];\n");
+	foreach ([['install', '--environment=dev'], ['status'], ['sync'], ['repair'], ['doctor'], ['migrate']] as $args) {
+		[$exit, , $output] = command($app, $args);
+		check($exit === 0, implode(' ', $args) . ' failed on a config that must be evaluated once. ' . $output);
+	}
+	check(!is_file($app . '/config/app.php'), 'The omit list of a config with declarations had no effect.');
+};
+$tests['doctor reports a broken config once and checks omit without manifests'] = static function () use ($base): void {
+	$app = fixture($base, 'omit-doctor');
+	$doctor = static function () use ($app): array {
+		[$exit, $result] = command($app, ['doctor']);
+		return [$exit, array_column($result['checks'] ?? [], null, 'name')];
+	};
+
+	put($app . '/config/citomni_installer.php', "<?php return 'not an array';");
+	[$exit, $checks] = $doctor();
+	check($exit === 1 && ($checks['installer_config']['status'] ?? null) === 'fail' && ($checks['omitted_targets']['status'] ?? null) === 'skip', 'Doctor reported a broken config twice.');
+
+	rename($app . '/vendor', $app . '/vendor-away');
+	try {
+		put($app . '/config/citomni_installer.php', "<?php return ['omit' => ['../config/app.php']];");
+		[, $checks] = $doctor();
+		check(($checks['omitted_targets']['status'] ?? null) === 'fail' && str_contains((string)($checks['omitted_targets']['detail'] ?? ''), 'Invalid omit entry'), 'Doctor skipped the shape of omit without manifests.');
+
+		put($app . '/config/citomni_installer.php', "<?php return ['omit' => ['config/app.php']];");
+		[, $checks] = $doctor();
+		check(($checks['omitted_targets']['status'] ?? null) === 'skip', 'Doctor matched omit entries without manifests.');
+	} finally {
+		rename($app . '/vendor-away', $app . '/vendor');
+	}
+};
+
 // Optional actual Composer verification, separate from deterministic failure injection.
+$composerPath = null;
 foreach (array_slice($argv, 1) as $argument) {
 	if (!str_starts_with($argument, '--composer=')) {
-		fwrite(STDERR, "Usage: php tests/installer-regression-test.php [--composer=/path/to/composer.phar]\n");
+		fwrite(STDERR, "Usage: php tests/lifecycle/run.php [--composer=/path/to/composer.phar]\n");
 		removeTree($base);
 		exit(2);
 	}
 	$composerPath = substr($argument, strlen('--composer='));
-	$tests['real Composer materializes dev/stage/prod/dev and skips root scripts'] = static function () use ($base, $composerPath): void {
-		$app = fixture($base, 'real composer');
-		$config = [
-			'name' => 'test/app',
-			'version' => '1.0.0',
-			'require' => ['php' => '>=8.5'],
-			'autoload' => ['psr-4' => ['TestApp\\' => 'src/']],
-			'config' => ['classmap-authoritative' => false, 'optimize-autoloader' => true],
-			'scripts' => ['post-autoload-dump' => '@php scripts/on-dump.php'],
-		];
-		put($app . '/composer.json', json_encode($config));
-		put($app . '/src/Known.php', '<?php namespace TestApp; final class Known {}');
-		put($app . '/scripts/on-dump.php', '<?php file_put_contents(__DIR__ . "/../root-script-ran", "1");');
-		$oldComposerHome = getenv('COMPOSER_HOME');
-		$oldSuperuser = getenv('COMPOSER_ALLOW_SUPERUSER');
-		$composerHome = $base . '/composer-home';
-		mkdir($composerHome);
-		putenv('COMPOSER_HOME=' . $composerHome);
-		putenv('COMPOSER_ALLOW_SUPERUSER=1');
-		try {
-			$guard = new PathGuard($app);
-			$state = ScaffoldState::forAppRoot($app);
-			$renderer = new ScaffoldRenderer();
-			$locator = ScaffoldManifestLocator::forAppRoot($app);
-			$builder = new BuildScaffoldPlan($guard, $renderer, $state);
-			$applier = new ApplyScaffoldPlan($guard, $renderer, $state);
-			$materializer = new ApplyEnvironmentMaterialization($applier, new ComposerRunner($app, $composerPath), $state);
-			$lock = new InstallerLock($guard);
-			foreach ([Environment::DEV, Environment::STAGE, Environment::PROD, Environment::DEV] as $i => $environment) {
-				$lock->acquire();
-				try {
-					$manifests = $locator->selectEnvironment($locator->discover(), $environment, $i !== 0);
-					$values = array_fill_keys(array_keys($manifests), ['APP_NAME' => 'fixture']);
-					$plan = $builder->build($i === 0 ? 'install' : 'environment', $manifests, $values, ['environment_materialization' => true]);
-					$result = $materializer->apply($plan, $environment);
-					check($result['ok'] && $state->environment() === $environment, 'Real Composer failed materialization.');
-				} finally {
-					$lock->release();
-				}
-				[$exit, $out, $err] = child([PHP_BINARY, '-r', '$loader = require "vendor/autoload.php"; echo json_encode([$loader->isClassMapAuthoritative(), class_exists("TestApp\\\\Known")]);'], $app);
-				check($exit === 0 && json_decode($out, true) === [$environment->classmapAuthoritative(), true], 'Actual generated autoloader posture or class loading is wrong. ' . $out . $err);
-				check(!is_file($app . '/root-script-ran'), 'Composer executed a root lifecycle script.');
+}
+$tests['real Composer materializes dev/stage/prod/dev and skips root scripts'] = static function () use ($base, $composerPath): void {
+	if ($composerPath === null) {
+		skip('pass --composer=/path/to/composer.phar to run it');
+	}
+	$app = fixture($base, 'real composer');
+	$config = [
+		'name' => 'test/app',
+		'version' => '1.0.0',
+		'require' => ['php' => '>=8.5'],
+		'autoload' => ['psr-4' => ['TestApp\\' => 'src/']],
+		'config' => ['classmap-authoritative' => false, 'optimize-autoloader' => true],
+		'scripts' => ['post-autoload-dump' => '@php scripts/on-dump.php'],
+	];
+	put($app . '/composer.json', json_encode($config));
+	put($app . '/src/Known.php', '<?php namespace TestApp; final class Known {}');
+	put($app . '/scripts/on-dump.php', '<?php file_put_contents(__DIR__ . "/../root-script-ran", "1");');
+	$oldComposerHome = getenv('COMPOSER_HOME');
+	$oldSuperuser = getenv('COMPOSER_ALLOW_SUPERUSER');
+	$composerHome = $base . '/composer-home';
+	mkdir($composerHome);
+	putenv('COMPOSER_HOME=' . $composerHome);
+	putenv('COMPOSER_ALLOW_SUPERUSER=1');
+	try {
+		$guard = new PathGuard($app);
+		$state = ScaffoldState::forAppRoot($app);
+		$renderer = new ScaffoldRenderer();
+		$locator = ScaffoldManifestLocator::forAppRoot($app);
+		$builder = new BuildScaffoldPlan($guard, $renderer, $state);
+		$applier = new ApplyScaffoldPlan($guard, $renderer, $state);
+		$materializer = new ApplyEnvironmentMaterialization($applier, new ComposerRunner($app, $composerPath), $state);
+		$lock = new InstallerLock($guard);
+		foreach ([Environment::DEV, Environment::STAGE, Environment::PROD, Environment::DEV] as $i => $environment) {
+			$lock->acquire();
+			try {
+				$manifests = $locator->selectEnvironment($locator->discover(), $environment, $i !== 0);
+				$values = array_fill_keys(array_keys($manifests), ['APP_NAME' => 'fixture']);
+				$plan = $builder->build($i === 0 ? 'install' : 'environment', $manifests, $values, ['environment_materialization' => true]);
+				$result = $materializer->apply($plan, $environment);
+				check($result['ok'] && $state->environment() === $environment, 'Real Composer failed materialization.');
+			} finally {
+				$lock->release();
 			}
-		} finally {
-			putenv($oldComposerHome === false ? 'COMPOSER_HOME' : 'COMPOSER_HOME=' . $oldComposerHome);
-			putenv($oldSuperuser === false ? 'COMPOSER_ALLOW_SUPERUSER' : 'COMPOSER_ALLOW_SUPERUSER=' . $oldSuperuser);
+			[$exit, $out, $err] = child([...php(), '-r', '$loader = require "vendor/autoload.php"; echo json_encode([$loader->isClassMapAuthoritative(), class_exists("TestApp\\\\Known")]);'], $app);
+			check($exit === 0 && json_decode($out, true) === [$environment->classmapAuthoritative(), true], 'Actual generated autoloader posture or class loading is wrong. ' . $out . $err);
+			check(!is_file($app . '/root-script-ran'), 'Composer executed a root lifecycle script.');
 		}
-	};
+	} finally {
+		putenv($oldComposerHome === false ? 'COMPOSER_HOME' : 'COMPOSER_HOME=' . $oldComposerHome);
+		putenv($oldSuperuser === false ? 'COMPOSER_ALLOW_SUPERUSER' : 'COMPOSER_ALLOW_SUPERUSER=' . $oldSuperuser);
+	}
+};
+
+
+// ----------------------------------------------------------------
+// Runner
+// ----------------------------------------------------------------
+
+$passed = 0;
+$failed = 0;
+$skipped = 0;
+foreach ($tests as $name => $test) {
+	try {
+		$test();
+		$passed++;
+		\fwrite(\STDOUT, "PASS {$name}\n");
+	} catch (CheckSkipped $e) {
+		$skipped++;
+		\fwrite(\STDOUT, "SKIP {$name}: {$e->getMessage()}\n");
+	} catch (CheckFailed $e) {
+		$failed++;
+		\fwrite(\STDERR, "FAIL {$name} - " . oneLine($e->getMessage()) . "\n");
+	} catch (\Throwable $e) {
+		$failed++;
+		\fwrite(\STDERR, "FAIL {$name} - " . $e::class . ': ' . oneLine($e->getMessage()) . "\n");
+	}
 }
 
-$failed = 0;
-try {
-	foreach ($tests as $name => $test) {
-		try {
-			$test();
-			echo 'PASS ' . $name . "\n";
-		} catch (Throwable $e) {
-			$failed++;
-			fwrite(STDERR, 'FAIL ' . $name . ': ' . $e->getMessage() . "\n");
-		}
-	}
-} finally {
-	foreach ($savedEnvironment as $key => $value) {
-		putenv($value === false ? $key : $key . '=' . $value);
-	}
-	removeTree($base);
+foreach ($savedEnvironment as $key => $value) {
+	putenv($value === false ? $key : $key . '=' . $value);
 }
-echo sprintf("\n%d tests, %d failures.\n", count($tests), $failed);
+
+// A run directory that cannot be removed is a failure, but must not swallow the totals.
+try {
+	removeTree($base);
+} catch (\Throwable $e) {
+	$failed++;
+	\fwrite(\STDERR, "FAIL removing the run directory {$base} - " . $e::class . ': ' . oneLine($e->getMessage()) . "\n");
+}
+
+\fwrite(\STDOUT, "{$passed} passed, {$failed} failed" . ($skipped > 0 ? ", {$skipped} skipped" : '') . "\n");
 exit($failed === 0 ? 0 : 1);

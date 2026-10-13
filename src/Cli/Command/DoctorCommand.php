@@ -19,6 +19,7 @@ use CitOmni\Installer\Cli\InstallerCli;
 use CitOmni\Installer\Enum\ExitCode;
 use CitOmni\Installer\Enum\Environment;
 use CitOmni\Installer\State\ScaffoldState;
+use CitOmni\Installer\Support\InstallerConfig;
 use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\ScaffoldManifestLocator;
@@ -32,7 +33,10 @@ use CitOmni\Installer\Exception\InstallerException;
  * - app-root and vendor/ presence,
  * - Composer metadata (installed.json),
  * - scaffold manifests (discovery also validates each manifest),
- * - the installer config (config/citomni_installer.php) via PlaceholderResolver,
+ * - the installer config (config/citomni_installer.php): it loads and its placeholders resolve,
+ * - its omit list: the shape always, the targets against every installed manifest when
+ *   discovery succeeded; entries without a target are a warning, managed targets and
+ *   invalid entries a failure,
  * - write access to the app-root and the var/ tree,
  * - the installer state file's format_version, if a state file exists.
  *
@@ -46,6 +50,7 @@ final class DoctorCommand {
 		private readonly ScaffoldManifestLocator $locator,
 		private readonly ScaffoldState $state,
 		private readonly PlaceholderResolver $placeholders,
+		private readonly InstallerConfig $config,
 		private readonly ComposerRunner $composer
 	) {}
 
@@ -81,6 +86,8 @@ final class DoctorCommand {
 		/** @var list<int> $failCodes */
 		$failCodes = [];
 		$manifests = [];
+		// Every installed manifest; null when discovery did not run or failed.
+		$discovered = null;
 		$recordedEnvironment = null;
 
 		// -- 1. app-root (already validated by PathGuard) -------------
@@ -109,9 +116,11 @@ final class DoctorCommand {
 			} else {
 				$checks[] = ['name' => 'composer_metadata', 'status' => 'ok', 'detail' => $installed];
 				try {
+					// Discover once: discovery validates every manifest, and the omit check needs them all.
+					$discovered = $this->locator->discover();
 					$manifests = $package !== null
-						? (($one = $this->locator->discoverPackage($package)) === null ? [] : [$package => $one])
-						: $this->locator->discover();
+						? (isset($discovered[$package]) ? [$package => $discovered[$package]] : [])
+						: $discovered;
 
 					if ($manifests === []) {
 						$detail = $package !== null
@@ -134,16 +143,50 @@ final class DoctorCommand {
 		}
 
 		// -- 4. Installer config (config/citomni_installer.php) -------
-		$configPath = $this->appRoot . '/config/citomni_installer.php';
-		if (!\is_file($configPath)) {
-			$checks[] = ['name' => 'installer_config', 'status' => 'ok', 'detail' => "No installer config present (config + CLI only): {$configPath}"];
+		$configLoaded = false;
+		try {
+			$config = $this->config->read();
+			$configLoaded = true;
+			if ($config === null) {
+				$checks[] = ['name' => 'installer_config', 'status' => 'ok', 'detail' => 'No installer config present (config + CLI only): ' . $this->config->path()];
+			} else {
+				$resolved = $this->placeholders->resolve([]);
+				$checks[] = ['name' => 'installer_config', 'status' => 'ok', 'detail' => \sprintf('Loaded %d placeholder(s) from %s', \count($resolved), $this->config->path())];
+			}
+		} catch (InstallerException $e) {
+			$checks[]    = ['name' => 'installer_config', 'status' => 'fail', 'detail' => $e->getMessage()];
+			$failCodes[] = ExitCode::GENERAL_ERROR->value;
+		}
+
+		// -- 4b. Omitted create-only targets -------------------------
+		// The shape of omit needs only the config. Its targets are matched against every
+		// installed manifest; a --package filter would misreport other packages' entries.
+		if (!$configLoaded) {
+			$checks[] = ['name' => 'omitted_targets', 'status' => 'skip', 'detail' => 'Skipped (installer config unavailable).'];
 		} else {
 			try {
-				$resolved = $this->placeholders->resolve([]);
-				$checks[] = ['name' => 'installer_config', 'status' => 'ok', 'detail' => \sprintf('Loaded %d placeholder(s) from %s', \count($resolved), $configPath)];
+				if ($discovered === null) {
+					$checks[] = $this->config->omitList() === []
+						? ['name' => 'omitted_targets', 'status' => 'ok', 'detail' => 'No create-only targets omitted.']
+						: ['name' => 'omitted_targets', 'status' => 'skip', 'detail' => 'Omit list is valid; its targets are not checked (scaffold manifests unavailable).'];
+				} else {
+					$omissions = $this->locator->omissions($discovered);
+					$parts = [];
+					if ($omissions['omitted'] !== []) {
+						$parts[] = 'Omitted: ' . \implode(', ', $omissions['omitted']) . '.';
+					}
+					if ($omissions['unmatched'] !== []) {
+						$parts[] = 'Not a target of any installed package, no effect: ' . \implode(', ', $omissions['unmatched']) . '.';
+					}
+					$checks[] = [
+						'name' => 'omitted_targets',
+						'status' => $omissions['unmatched'] !== [] ? 'warn' : 'ok',
+						'detail' => $parts === [] ? 'No create-only targets omitted.' : \implode(' ', $parts),
+					];
+				}
 			} catch (InstallerException $e) {
-				$checks[]    = ['name' => 'installer_config', 'status' => 'fail', 'detail' => $e->getMessage()];
-				$failCodes[] = 1;
+				$checks[]    = ['name' => 'omitted_targets', 'status' => 'fail', 'detail' => $e->getMessage()];
+				$failCodes[] = ExitCode::GENERAL_ERROR->value;
 			}
 		}
 

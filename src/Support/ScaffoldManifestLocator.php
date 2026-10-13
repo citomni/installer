@@ -24,6 +24,9 @@ use CitOmni\Installer\Exception\InstallerException;
 /**
  * Locates, validates, and environment-normalizes package scaffold manifests.
  *
+ * It also resolves the application's omit list from config/citomni_installer.php,
+ * read through InstallerConfig, against the discovered manifests (see omissions()).
+ *
  * Discovery remains read-only. Source-only entries are normalized immediately.
  * Environment-aware entries are fully validated during discovery, but their source
  * is selected only through selectEnvironment(), before BuildScaffoldPlan sees them.
@@ -50,15 +53,18 @@ final class ScaffoldManifestLocator {
 
 	private ComposerPackageDiscovery $discovery;
 	private PathGuard $pathGuard;
+	private InstallerConfig $config;
 
 
 	/**
 	 * @param ComposerPackageDiscovery $discovery Installed-package metadata source.
 	 * @param PathGuard $pathGuard Guard constructed with the application root.
+	 * @param InstallerConfig $config The application's installer config, source of the omit list.
 	 */
-	public function __construct(ComposerPackageDiscovery $discovery, PathGuard $pathGuard) {
+	public function __construct(ComposerPackageDiscovery $discovery, PathGuard $pathGuard, InstallerConfig $config) {
 		$this->discovery = $discovery;
 		$this->pathGuard = $pathGuard;
+		$this->config = $config;
 	}
 
 
@@ -66,12 +72,14 @@ final class ScaffoldManifestLocator {
 	 * Build a locator for the conventional vendor/ directory under an application root.
 	 *
 	 * @param string $appRoot Application root.
+	 * @param InstallerConfig|null $config Shared installer config, so the file is evaluated once per run; null creates one.
 	 * @return self
 	 */
-	public static function forAppRoot(string $appRoot): self {
+	public static function forAppRoot(string $appRoot, ?InstallerConfig $config = null): self {
 		$appRoot = \rtrim($appRoot, "/\\");
+		$pathGuard = new PathGuard($appRoot);
 
-		return new self(ComposerPackageDiscovery::forAppRoot($appRoot), new PathGuard($appRoot));
+		return new self(ComposerPackageDiscovery::forAppRoot($appRoot), $pathGuard, $config ?? new InstallerConfig($pathGuard->appRoot()));
 	}
 
 
@@ -356,6 +364,110 @@ final class ScaffoldManifestLocator {
 		}
 
 		return $rules;
+	}
+
+
+	/**
+	 * Resolve the application's omit list against the installed manifests.
+	 *
+	 * Behavior:
+	 * - Reads `omit` from config/citomni_installer.php through InstallerConfig.
+	 * - An entry naming a create-only target is omitted. The result uses the manifest's
+	 *   spelling of the target, which BuildScaffoldPlan matches exactly.
+	 * - An entry naming a managed target is rejected: the package owns that file, and the
+	 *   application cannot run without it.
+	 * - An entry naming no installed target is returned as unmatched and has no effect,
+	 *   so an application keeps working when a package stops shipping a file.
+	 * - On Windows, entries match targets case-insensitively, like the target collision
+	 *   checks in discover().
+	 *
+	 * Notes:
+	 * - Pass discover() output. A package filter would turn entries for other packages
+	 *   into unmatched ones.
+	 *
+	 * Typical usage:
+	 *   $omitted = $locator->omissions($discovered)['omitted'];
+	 *   $plan = $builder->build('sync', $manifests, $placeholders, ['omit' => $omitted]);
+	 *
+	 * @param array<string,array<string,mixed>> $manifests Discovered manifests.
+	 * @return array{omitted:list<string>,unmatched:list<string>} Omitted create-only targets and entries without a target, each sorted.
+	 * @throws InstallerException When the config cannot be read, `omit` has an invalid shape, or an entry names a managed target.
+	 */
+	public function omissions(array $manifests): array {
+		$omit = $this->config->omitList();
+		if ($omit === []) {
+			return ['omitted' => [], 'unmatched' => []];
+		}
+
+		$caseInsensitive = \PHP_OS_FAMILY === 'Windows';
+		$owners = [];
+		foreach ($manifests as $pkgName => $manifest) {
+			foreach ((array)($manifest['files'] ?? []) as $file) {
+				$target = Path::normalizeRelative((string)($file['target'] ?? ''));
+				$key = $caseInsensitive ? \strtolower($target) : $target;
+				$owners[$key] = [
+					'package' => (string)$pkgName,
+					'target' => $target,
+					'policy' => (string)($file['policy'] ?? ''),
+				];
+			}
+		}
+
+		$omitted = [];
+		$unmatched = [];
+		foreach ($omit as $entry) {
+			$owner = $owners[$caseInsensitive ? \strtolower($entry) : $entry] ?? null;
+			if ($owner === null) {
+				$unmatched[] = $entry;
+				continue;
+			}
+
+			if ($owner['policy'] !== 'create-only') {
+				throw new InstallerException(\sprintf(
+					'Installer config omits %s, which %s manages. Only create-only targets can be omitted; remove it from omit.',
+					$owner['target'],
+					$owner['package']
+				));
+			}
+
+			$omitted[$owner['target']] = true;
+		}
+
+		$omitted = \array_map('strval', \array_keys($omitted));
+		\sort($omitted, \SORT_STRING);
+
+		return ['omitted' => $omitted, 'unmatched' => $unmatched];
+	}
+
+
+	/**
+	 * Drop omitted targets from manifests for flows that inspect scaffold sources.
+	 *
+	 * Migration diagnostics derive placeholder requirements and source warnings from
+	 * every stub. An omitted target's stub is never rendered, so it must not demand
+	 * placeholders or raise warnings.
+	 *
+	 * @param array<string,array<string,mixed>> $manifests Discovered or selected manifests.
+	 * @param list<string> $omitted Omitted targets from omissions().
+	 * @return array<string,array<string,mixed>> Manifests without the omitted file entries.
+	 */
+	public function withoutOmitted(array $manifests, array $omitted): array {
+		if ($omitted === []) {
+			return $manifests;
+		}
+
+		$skip = \array_fill_keys($omitted, true);
+		foreach ($manifests as $pkgName => $manifest) {
+			$files = [];
+			foreach ((array)($manifest['files'] ?? []) as $file) {
+				if (!isset($skip[Path::normalizeRelative((string)($file['target'] ?? ''))])) {
+					$files[] = $file;
+				}
+			}
+			$manifests[$pkgName]['files'] = $files;
+		}
+
+		return $manifests;
 	}
 
 

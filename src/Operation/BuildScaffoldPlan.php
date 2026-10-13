@@ -44,6 +44,8 @@ use CitOmni\Installer\Exception\FilesystemException;
  *   matches the prior baseline (clean).
  * - With the `gitignore` option it also plans the installer block in the app's
  *   .gitignore from the complete installed rule set (see planGitignore()).
+ * - Create-only targets passed in the `omit` option are reported as `omitted` and
+ *   never acted on (see planOmitted()).
  *
  * Return shape (arrays only):
  *   [
@@ -122,7 +124,9 @@ final class BuildScaffoldPlan {
 	 *                                                           'migration_environment_changed'=>bool,
 	 *                                                           'gitignore'=>array{ignore:list<string>,exceptions:list<string>,targets:list<string>}
 	 *                                                           block input for ALL installed packages, from
-	 *                                                           ScaffoldManifestLocator::gitignoreRules()].
+	 *                                                           ScaffoldManifestLocator::gitignoreRules(),
+	 *                                                           'omit'=>list<string> create-only targets the application
+	 *                                                           omits, from ScaffoldManifestLocator::omissions()].
 	 * @return array<string,mixed>               The plan (arrays only).
 	 * @throws InstallerException  On unknown command, unsafe path, missing source, or unsafe state.
 	 */
@@ -139,6 +143,10 @@ final class BuildScaffoldPlan {
 		$scope = (isset($options['target']) && \is_string($options['target']) && $options['target'] !== '')
 			? Path::normalizeRelative($options['target'])
 			: null;
+		$omit = [];
+		foreach ((array)($options['omit'] ?? []) as $omitted) {
+			$omit[Path::normalizeRelative((string)$omitted)] = true;
+		}
 
 		// Legacy migration deliberately rebuilds state from current manifests and disk.
 		// Current v2 migration reconciliation keeps the recorded managed baseline so local
@@ -157,18 +165,24 @@ final class BuildScaffoldPlan {
 
 			$files = [];
 			foreach ((array)($manifest['files'] ?? []) as $file) {
-				$entry = $this->planFile(
-					$command,
-					$packageRoot,
-					(array)$file,
-					$pkgPlaceholders,
-					$pkgState,
-					$force,
-					$scope,
-					$environmentMaterialization,
-					$migrationReconcile,
-					$migrationEnvironmentChanged
-				);
+				// Normalize only when something is omitted; planFile() validates the target itself.
+				$normTarget = $omit === [] ? '' : Path::normalizeRelative((string)($file['target'] ?? ''));
+				if (isset($omit[$normTarget])) {
+					$entry = $this->planOmitted((array)$file, $normTarget, $scope);
+				} else {
+					$entry = $this->planFile(
+						$command,
+						$packageRoot,
+						(array)$file,
+						$pkgPlaceholders,
+						$pkgState,
+						$force,
+						$scope,
+						$environmentMaterialization,
+						$migrationReconcile,
+						$migrationEnvironmentChanged
+					);
+				}
 				if ($entry !== null) {
 					$files[] = $entry;
 				}
@@ -343,6 +357,42 @@ final class BuildScaffoldPlan {
 		}
 
 		return $entry;
+	}
+
+
+	/**
+	 * Report a create-only target that the application omits.
+	 *
+	 * The application lists the target under `omit` in config/citomni_installer.php.
+	 * Every command leaves the path alone: nothing is created, updated, backed up,
+	 * recorded in state or written as `.new`, also with --force. Existing bytes stay as
+	 * they are, and the target's stub is never read or rendered.
+	 *
+	 * @param array<string,mixed> $file Manifest file entry.
+	 * @param string $normTarget Normalized target.
+	 * @param string|null $scope Single-file scope, if any.
+	 * @return array<string,mixed>|null Plan entry with status `omitted`, or null when filtered out by scope.
+	 * @throws InstallerException When the target is not create-only; ScaffoldManifestLocator::omissions() rejects those first.
+	 */
+	private function planOmitted(array $file, string $normTarget, ?string $scope): ?array {
+		if ($scope !== null && $normTarget !== $scope) {
+			return null;
+		}
+
+		$policy = (string)($file['policy'] ?? '');
+		if ($policy !== 'create-only') {
+			throw new InstallerException("Only create-only targets can be omitted; '{$normTarget}' uses policy '{$policy}'.");
+		}
+
+		return [
+			'target' => $normTarget,
+			'source' => Path::normalizeRelative((string)($file['source'] ?? '')),
+			'type'   => (string)($file['type'] ?? ''),
+			'policy' => $policy,
+			'status' => 'omitted',
+			'reason' => 'listed_in_omit',
+			'action' => 'none',
+		];
 	}
 
 

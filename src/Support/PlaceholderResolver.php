@@ -20,9 +20,10 @@ use CitOmni\Installer\Exception\InstallerException;
 /**
  * Resolves scaffold placeholder values without booting CitOmni.
  *
- * Reads app-local installer placeholder config and overlays explicit CLI values.
- * This is intentionally small and boring: no composer.json inference, no runtime
- * config reads, no App dependency, and no template behavior. Tiny gates, fewer trolls.
+ * Reads the `placeholders` entry of the app-local installer config through
+ * InstallerConfig and overlays explicit CLI values. This is intentionally small and
+ * boring: no composer.json inference, no runtime config reads, no App dependency, and
+ * no template behavior. Tiny gates, fewer trolls.
  *
  * Behavior:
  * - Missing config/citomni_installer.php is allowed and contributes no placeholders.
@@ -34,7 +35,7 @@ use CitOmni\Installer\Exception\InstallerException;
  * - PROD_ROOT_URL and STAGE_ROOT_URL MUST NOT have a trailing slash.
  *
  * Typical usage:
- *   $resolver = new PlaceholderResolver($appRoot);
+ *   $resolver = new PlaceholderResolver($appRoot, $config);
  *   $values = $resolver->resolve(['APP_NAMESPACE' => 'App']);
  *
  * @throws InstallerException When app root, config shape, placeholder key, or value is invalid.
@@ -43,8 +44,6 @@ final class PlaceholderResolver {
 
 	/** Canonical placeholder key: uppercase, digits, underscores; must start with a letter. */
 	private const KEY_PATTERN = '/^[A-Z][A-Z0-9_]*$/';
-
-	private const CONFIG_RELATIVE_PATH = 'config/citomni_installer.php';
 
 	/** Root URL placeholders must be canonical base URLs without a trailing slash. */
 	private const ROOT_URL_PLACEHOLDERS = [
@@ -58,16 +57,20 @@ final class PlaceholderResolver {
 		'STAGE_ROOT_HOST' => 'STAGE_ROOT_URL',
 	];
 
-	private string $appRoot;
+	private InstallerConfig $config;
 
 
 	/**
 	 * Create a placeholder resolver for an app root.
 	 *
+	 * Pass the InstallerConfig that the other collaborators of the same command use, so
+	 * config/citomni_installer.php is evaluated once per run.
+	 *
 	 * @param string $appRoot Absolute or process-relative existing app root path.
+	 * @param InstallerConfig|null $config Shared installer config; null creates one for the resolved app root.
 	 * @throws InstallerException When the app root is empty, missing, not a directory, or unreadable.
 	 */
-	public function __construct(string $appRoot) {
+	public function __construct(string $appRoot, ?InstallerConfig $config = null) {
 		$appRoot = \rtrim(\trim($appRoot), "\\/");
 		if ($appRoot === '') {
 			throw new InstallerException('App root must not be empty.');
@@ -82,7 +85,7 @@ final class PlaceholderResolver {
 			throw new InstallerException(\sprintf('App root is not readable: %s', $resolvedAppRoot));
 		}
 
-		$this->appRoot = $resolvedAppRoot;
+		$this->config = $config ?? new InstallerConfig($resolvedAppRoot);
 	}
 
 
@@ -206,55 +209,19 @@ final class PlaceholderResolver {
 	 * @throws InstallerException When the existing config cannot be loaded or has invalid shape.
 	 */
 	private function loadConfigPlaceholders(): array {
-		$configPath = $this->appRoot . '/' . self::CONFIG_RELATIVE_PATH;
-
-		if (!\is_file($configPath)) {
-			return [];
-		}
-
-		if (!\is_readable($configPath)) {
-			throw new InstallerException(\sprintf('Installer config is not readable: %s', $configPath));
-		}
-
-		$config = $this->loadConfigFile($configPath);
-		if (!\is_array($config)) {
-			throw new InstallerException(\sprintf('Installer config must return an array: %s', $configPath));
-		}
-
-		if (!\array_key_exists('placeholders', $config)) {
+		$config = $this->config->read();
+		if ($config === null || !\array_key_exists('placeholders', $config)) {
 			return [];
 		}
 
 		if (!\is_array($config['placeholders'])) {
 			throw new InstallerException(\sprintf(
 				'Installer config placeholders entry must be an array when present: %s',
-				$configPath
+				$this->config->path()
 			));
 		}
 
 		return $this->validatedPlaceholderMap($config['placeholders'], 'installer config');
-	}
-
-
-	/**
-	 * Load a PHP config file in an isolated static scope.
-	 *
-	 * @param string $configPath Absolute path to config/citomni_installer.php.
-	 * @return mixed Value returned by the config file.
-	 * @throws InstallerException When PHP cannot evaluate the config file.
-	 */
-	private function loadConfigFile(string $configPath): mixed {
-		try {
-			return (static function (string $path): mixed {
-				return require $path;
-			})($configPath);
-		} catch (\Throwable $e) {
-			throw new InstallerException(\sprintf(
-				'Failed to load installer config %s: %s',
-				$configPath,
-				$e->getMessage()
-			), 0, $e);
-		}
 	}
 
 

@@ -40,7 +40,8 @@ use CitOmni\Installer\Support\InstallerLock;
  * Install also maintains the installer block in .gitignore, planned from every
  * installed package even when --package narrows the scaffold files, and creates a
  * missing .gitignore in a Git checkout. Malformed block markers stop install before
- * writing, like an environment conflict.
+ * writing, like an environment conflict. Create-only targets the application omits in
+ * config/citomni_installer.php are never created.
  */
 final class InstallCommand extends AbstractWriteCommand {
 
@@ -133,6 +134,7 @@ final class InstallCommand extends AbstractWriteCommand {
 				'force' => $opt['force'],
 				'environment_materialization' => true,
 				'gitignore' => $this->locator->gitignoreRules($discovered),
+				'omit' => $this->locator->omissions($discovered)['omitted'],
 			]);
 		} catch (InstallerException $e) {
 			return $this->fail(

@@ -30,6 +30,7 @@ use CitOmni\Installer\Operation\BuildMigrationDiagnostics;
 use CitOmni\Installer\Operation\BuildScaffoldPlan;
 use CitOmni\Installer\State\ScaffoldState;
 use CitOmni\Installer\Support\AppSkeletonReferenceFetcher;
+use CitOmni\Installer\Support\InstallerConfig;
 use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\ScaffoldManifestLocator;
@@ -108,13 +109,15 @@ final class InstallerCli {
 		try {
 			$pathGuard   = new PathGuard($this->appRoot);
 			$appRoot     = $pathGuard->appRoot();
-			$resolver    = new PlaceholderResolver($appRoot);
+			// One shared reader: config/citomni_installer.php is evaluated at most once per run.
+			$config      = new InstallerConfig($appRoot);
+			$resolver    = new PlaceholderResolver($appRoot, $config);
 		} catch (InstallerException $e) {
 			\fwrite(\STDERR, $e->getMessage() . "\n");
 			return ExitCode::IO_ERROR->value;
 		}
 
-		$locator = ScaffoldManifestLocator::forAppRoot($appRoot);
+		$locator = ScaffoldManifestLocator::forAppRoot($appRoot, $config);
 		$state   = ScaffoldState::forAppRoot($appRoot);
 
 		// -- 4. Dispatch ----------------------------------------------
@@ -122,7 +125,7 @@ final class InstallerCli {
 			switch ($name) {
 				case 'doctor':
 					$composer = new ComposerRunner($appRoot);
-					return (new DoctorCommand($appRoot, $pathGuard, $locator, $state, $resolver, $composer))->run($cmdArgs);
+					return (new DoctorCommand($appRoot, $pathGuard, $locator, $state, $resolver, $config, $composer))->run($cmdArgs);
 
 				case 'status':
 					$builder = new BuildScaffoldPlan($pathGuard, new ScaffoldRenderer(), $state);
@@ -353,8 +356,9 @@ Usage:
   citomni-installer doctor [--package=<vendor/name>] [--environment=<dev|stage|prod>] [--format=text|json]
 
 Checks app-root, vendor/, Composer metadata, scaffold manifests, the installer
-config (config/citomni_installer.php) and write access. If a state file exists it
-is read to confirm its format_version is supported. Nothing is created or written.
+config (config/citomni_installer.php, including its omit list) and write access. If
+a state file exists it is read to confirm its format_version is supported. Nothing
+is created or written.
 
 Exit codes:
   0  ok            1  manifest/config error
@@ -369,7 +373,8 @@ Usage:
                            [--placeholder=KEY=VALUE ...]
 
 Reports per file: missing, up_to_date, update_available (stub drift),
-placeholder_drift, local_modified, unknown_existing, create_only_present.
+placeholder_drift, local_modified, unknown_existing, create_only_present, or
+omitted (a create-only target listed under omit in config/citomni_installer.php).
 Also compares the citomni/installer block in .gitignore with every installed
 package: up_to_date, update_available (also a .gitignore missing in a Git
 checkout), malformed, absent (no .gitignore outside a Git checkout), or
@@ -403,7 +408,8 @@ and never acts as an environment switch. Initial materialization requires all
 packages; --package is available only after an environment is recorded. Install
 also writes the citomni/installer block in .gitignore from every installed
 package, creating a missing .gitignore in a Git checkout; malformed block markers
-stop it before writing. Use --dry-run to preview.
+stop it before writing. Create-only targets listed under omit in
+config/citomni_installer.php are never created. Use --dry-run to preview.
 
 Exit codes:
   0  applied / nothing to do   4  conflicts (existing files in the way)
@@ -425,7 +431,8 @@ against current package sources. Create-only PHP code differences are preserved 
 receive a freshly generated `<target>.new` on every real run as advisory review items;
 they do not block Composer posture or v2 state completion. Existing generated sidecars
 are overwritten deliberately. Existing `*.tpl` targets are authoritative
-current templates. The command also audits installer placeholders, reports advisory
+current templates. Create-only targets listed under omit in config/citomni_installer.php
+are skipped. The command also audits installer placeholders, reports advisory
 percent-style uppercase tokens found in current package scaffold sources, compares root
 references with one pinned current citomni/app-skeleton commit while ignoring line-ending
 and one final-newline difference, recursively runs
@@ -466,8 +473,9 @@ Usage:
                            [--placeholder=KEY=VALUE ...] [--dry-run]
 
 Recreates only files that are MISSING on disk, using the placeholders recorded in
-the state file, then refreshes their baseline. Existing files are never touched and
---force has no effect. Warns when the recorded stub differs from the current stub.
+the state file, then refreshes their baseline. Existing files and targets listed
+under omit in config/citomni_installer.php are never touched, and --force has no
+effect. Warns when the recorded stub differs from the current stub.
 This is not a restore: it does not bring back historical bytes.
 
 Exit codes:
@@ -482,7 +490,8 @@ Usage:
   citomni-installer sync [target] [--package=<vendor/name>] [--format=text|json]
                          [--placeholder=KEY=VALUE ...] [--force] [--dry-run]
 
-Creates missing scaffold files and moves managed files forward to the current
+Creates missing scaffold files, except create-only targets listed under omit in
+config/citomni_installer.php, and moves managed files forward to the current
 stub/placeholders, but only while the file on disk still matches its recorded
 baseline. Locally modified files are never overwritten by default: a sibling
 <target>.new is written instead. With --force, the existing file is backed up and

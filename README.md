@@ -2,7 +2,7 @@
 
 Official scaffold lifecycle tool for CitOmni applications.
 
-Environment materialization uses explicit `dev`, `stage`, or `prod` selection and strict state format 2. See [environment materialization](docs/environment-materialization.md) for recovery, locking, Composer requirements, and regression tests.
+Environment materialization uses explicit `dev`, `stage`, or `prod` selection and strict state format 2. See [environment materialization](docs/environment-materialization.md) for recovery, locking, Composer requirements, and tests.
 
 `citomni/installer` is the package-owned scaffold materializer for the CitOmni ecosystem. It discovers scaffold manifests from installed Composer packages, renders package-owned scaffold files, writes the few files that must physically exist in the application layer, and tracks their state so future repairs and scaffold updates can be handled safely.
 
@@ -220,7 +220,7 @@ Examples:
 
 - `public/index.php` comes from `citomni/http`.
 - `bin/citomni` comes from `citomni/cli`.
-- `config/citomni_installer.php` may be added by the app to provide versioned placeholder configuration when scaffold placeholders are needed.
+- `config/citomni_installer.php` may be added by the app to provide versioned placeholder configuration when scaffold placeholders are needed, and to [omit create-only targets](#omitting-create-only-targets) it does not want.
 
 After `composer create-project`, root-level files are app-owned. Outside the explicit legacy `migrate` workflow, `citomni/installer` writes only targets declared by discovered scaffold manifests, plus its own delimited block in `.gitignore`, which it creates in a Git checkout that has none (see [.gitignore block](#gitignore-block)); every line outside that block stays app-owned. App-owned files such as `README.md`, `.gitignore`, `composer.json`, and `composer.lock` should therefore not be declared as package-owned scaffold targets. `.gitignore` is reserved and rejected as a target.
 
@@ -375,6 +375,7 @@ Typical checks include:
 - Presence of `vendor/`.
 - Readability of Composer metadata.
 - Discovery of scaffold manifests.
+- The installer config, including its [omit list](#omitting-create-only-targets): a managed target or an invalid entry fails, and an entry no installed package declares is a warning.
 - Write access diagnostics for relevant app paths.
 - State readability and format validation where relevant.
 
@@ -389,7 +390,7 @@ vendor/bin/citomni-installer doctor --format=json
 
 Shows scaffold status without changing files.
 
-It reports whether known scaffold targets are missing, clean, locally modified, affected by upstream stub changes, affected by placeholder changes, or blocked from automatic sync.
+It reports whether known scaffold targets are missing, clean, locally modified, affected by upstream stub changes, affected by placeholder changes, or blocked from automatic sync. A create-only target the application [omits](#omitting-create-only-targets) is reported as `omitted`, which does not affect the exit code.
 
 It also compares the [.gitignore block](#gitignore-block) with every installed package, including with `--package`: `up_to_date`, `update_available` (exit `3`, also for a Git checkout without a `.gitignore`), `malformed` (exit `4`), `absent` when the application has no `.gitignore` and lies outside a Git checkout, or `unsupported` when the installer cannot maintain it, such as a symlinked `.gitignore`.
 
@@ -407,7 +408,7 @@ Materializes scaffold for an explicitly selected environment. The first install 
 
 Default behavior:
 
-- Creates missing files.
+- Creates missing files, except create-only targets the application [omits](#omitting-create-only-targets).
 - Does not overwrite existing files.
 - Registers created files and adopts existing exact rendered matches in installer state.
 - Leaves a clean recorded baseline that lags behind the installed package to `sync`.
@@ -446,16 +447,18 @@ The command is deliberately repeatable:
 - Current v2 state uses reconciliation mode and keeps its managed-file baselines, so
   clean upstream drift can move forward while locally modified managed files receive
   `.new` instead of being overwritten.
-- Every create-only target is compared again against the current rendered source on
-  every run. Legitimate app-specific differences therefore keep appearing as advisory
-  review items and receive a freshly generated `.new` reference each time without
-  blocking Composer posture or v2 state completion.
+- Every create-only target that is not [omitted](#omitting-create-only-targets) is
+  compared again against the current rendered source on every run. Legitimate
+  app-specific differences therefore keep appearing as advisory review items and
+  receive a freshly generated `.new` reference each time without blocking Composer
+  posture or v2 state completion.
 - Existing `.new` files are generated artifacts and are overwritten on every real run.
   Do not use them as a workspace for manual merge edits.
 - Existing `.tpl` targets are authoritative package templates and are refreshed when
   they differ.
 - `config/citomni_installer.php` is audited for missing and currently unused values.
 - Current package scaffold sources are scanned for `%UPPER_SNAKE_CASE%`-style tokens and reported as advisory source-hygiene warnings without changing migrate exit behavior.
+- Stubs of omitted targets are left out of the config audit and the source scan.
 - The [.gitignore block](#gitignore-block) is refreshed from every installed package, and
   a missing `.gitignore` is created in a Git checkout; malformed block markers stop
   migration before it writes anything.
@@ -505,6 +508,7 @@ Default behavior:
 - Writes only files that are missing.
 - Does not overwrite existing files.
 - Requires recorded installer state with a placeholder snapshot for the missing target; without it, the target is left untouched.
+- Never recreates a create-only target the application [omits](#omitting-create-only-targets), also when state records it.
 - Uses the recorded placeholder snapshot rather than current `config/citomni_installer.php` or CLI placeholder overrides for the recreated file.
 - Updates the baseline for files it recreates.
 - Reports `recreated_stub_drift` when the recorded stub checksum differs from the currently installed package stub.
@@ -523,7 +527,7 @@ Updates managed scaffold files safely.
 
 Default behavior:
 
-- Creates missing scaffold files, including missing `managed` and `create-only` targets.
+- Creates missing scaffold files, including missing `managed` and `create-only` targets, except create-only targets the application [omits](#omitting-create-only-targets).
 - Updates files that still match the previous rendered baseline.
 - Does not overwrite locally modified files.
 - Writes the current rendered scaffold to `.new` when a local modification blocks automatic sync.
@@ -745,11 +749,49 @@ Examples:
 
 Rules:
 
-- Create if missing.
+- Create if missing, unless the application [omits](#omitting-create-only-targets) the target.
 - Register newly created files in state.
 - Do not update automatically.
 - Do not treat upstream drift as an automatic update signal.
 - Require explicit force or manual action for replacement.
+
+---
+
+## Omitting create-only targets
+
+A create-only file belongs to the application once it exists, and that includes deleting it. The installer cannot tell a target that a package has just added from one the application removed on purpose: both are missing. Without an explicit choice, every `sync`, and every `install` in a fresh checkout or a build, creates the file again.
+
+The application lists the create-only targets it does not want under `omit` in `config/citomni_installer.php`:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+return [
+	'placeholders' => [
+		// ...
+	],
+	'omit' => [
+		'templates/member/.gitkeep',
+		'public/assets/.gitkeep',
+	],
+];
+```
+
+Because the file is versioned, the choice applies on every machine, in fresh checkouts and in builds. Installer state lives under `var/state` and stays on one machine, so it cannot carry the choice.
+
+Rules:
+
+- `install`, `sync`, `repair` and `migrate` never create, update or back up an omitted target, never write its `.new`, and never add or refresh its state record, also not with `--force`. An existing file keeps its bytes.
+- `status` reports the target as `omitted` with reason `listed_in_omit`, and it does not count as drift.
+- The target's stub is never read or rendered, so it requires no placeholders, and migration diagnostics ignore it.
+- Only create-only targets can be omitted. A managed target is owned by its package, and the application cannot run without it, so `status`, `install`, `sync`, `repair` and `migrate` fail until the entry is removed.
+- Entries are app-relative paths with forward slashes and without `..`. They are normalized like manifest targets, so `./public//assets/.gitkeep` names `public/assets/.gitkeep`, and then compared with the targets exactly; on Windows, case-insensitively.
+- An entry that no installed package declares has no effect, so an application keeps working when a package stops shipping a file. `doctor` warns about it.
+- Removing an entry restores ordinary create-only behavior: the next `sync` creates the file if it is missing.
+
+Older installer versions read only `placeholders` and ignore `omit`.
 
 ---
 
@@ -857,6 +899,8 @@ return [
 ];
 ```
 
+The same file can also list create-only targets to [omit](#omitting-create-only-targets).
+
 Placeholder precedence, from highest to lowest:
 
 1. CLI `--placeholder=KEY=VALUE` options.
@@ -926,11 +970,12 @@ The table below covers ordinary scaffold lifecycle commands. `environment <env>`
 | Managed target matches previous `rendered_checksum` | Leave unchanged if it also matches the current render; otherwise update to the current render |
 | Target is locally modified | Do not overwrite |
 | Target is `create-only` and exists | Do not touch unless explicitly forced |
+| Target is `create-only` and listed under `omit` | Leave it alone, also when forced: no create, update, backup or `.new`, and no new or refreshed state record; `status` reports `omitted` |
 | Environment-aware target differs during `install` | Stop before writing and list every blocking target |
 | `.gitignore` installer block differs | Rewrite the block only; malformed markers conflict, and `install`/`migrate` stop before writing |
 | `.gitignore` is missing in a Git checkout | Create it with the block alone; a `.gitignore` that appears after planning is a conflict |
 | Target is outside app root | Fail |
-| Source is missing in package | Fail |
+| Source is missing in package | Fail, unless the target is omitted |
 | Manifest is invalid | Fail |
 | State is unknown or unsafe | Fail without materializing scaffold or committing state; a real write command may leave its administrative lock file |
 
@@ -995,6 +1040,7 @@ Interactive confirmation is not available in JSON mode. When a forced overwrite 
 Status, reason, and error values should distinguish at least:
 
 - Missing target.
+- Omitted target (`omitted`, reason `listed_in_omit`).
 - Local modification.
 - Upstream stub drift.
 - Placeholder drift.
