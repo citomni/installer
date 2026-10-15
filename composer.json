@@ -24,7 +24,7 @@
 	],
 	"require": {
 		"php": "^8.5",
-		"citomni/kernel": "^1.0"
+		"citomni/kernel": "^1.0.2.7"
 	},
 	"bin": [
 		"bin/citomni-installer"
