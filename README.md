@@ -341,11 +341,13 @@ Example:
 ```json
 {
 	"scripts": {
+		"citomni:doctor": "vendor/bin/citomni-installer doctor",
 		"citomni:status": "vendor/bin/citomni-installer status",
-		"citomni:install": "vendor/bin/citomni-installer install --environment=dev",
-		"citomni:sync": "vendor/bin/citomni-installer sync",
+		"citomni:install": "vendor/bin/citomni-installer install",
+		"citomni:migrate": "vendor/bin/citomni-installer migrate",
+		"citomni:environment": "vendor/bin/citomni-installer environment",
 		"citomni:repair": "vendor/bin/citomni-installer repair",
-		"citomni:doctor": "vendor/bin/citomni-installer doctor"
+		"citomni:sync": "vendor/bin/citomni-installer sync"
 	}
 }
 ```
@@ -354,8 +356,12 @@ Usage:
 
 ```bash
 composer citomni:status
+composer citomni:install -- --environment=dev
+composer citomni:environment -- prod
 composer citomni:sync
 ```
+
+Keep `--environment` out of the `citomni:install` script: without it, install fails instead of materializing dev files in a stage or production checkout.
 
 These scripts belong to the application. `citomni/installer` must not rewrite `composer.json` to add or modify them.
 
