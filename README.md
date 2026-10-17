@@ -465,6 +465,10 @@ The command is deliberately repeatable:
 - `config/citomni_installer.php` is audited for missing and currently unused values.
 - Current package scaffold sources are scanned for `%UPPER_SNAKE_CASE%`-style tokens and reported as advisory source-hygiene warnings without changing migrate exit behavior.
 - Stubs of omitted targets are left out of the config audit and the source scan.
+- Existing files that v2 state records but no installed package declares any more are
+  listed as retired scaffold files: `unmodified` or `local_modified` for a managed file
+  compared with its recorded checksum, `app_owned` for a create-only file. No command
+  updates or deletes them. Rebuild mode lists none, because legacy state holds no v2 records.
 - The [.gitignore block](#gitignore-block) is refreshed from every installed package, and
   a missing `.gitignore` is created in a Git checkout; malformed block markers stop
   migration before it writes anything.
@@ -502,8 +506,8 @@ vendor/bin/citomni-installer migrate --environment=prod
 ```
 
 A blocking managed-file `.new`, conflict, or PHP lint failure results in exit 4 so
-required corrective action cannot be missed. Create-only `.new` references and app-skeleton
-root-file differences are advisory.
+required corrective action cannot be missed. Create-only `.new` references, app-skeleton
+root-file differences, and retired scaffold files are advisory.
 
 ### `repair`
 

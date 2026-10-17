@@ -929,6 +929,39 @@ $tests['migrate reports percent-style tokens in current scaffold sources without
 	check(str_contains($report, '## Current scaffold source warnings') && str_contains($report, '%LEGACY_TOKEN%'), 'Migration report omitted the source warning details.');
 };
 
+$tests['migrate lists retired scaffold files that still exist without blocking or touching them'] = static function () use ($base): void {
+	$app = fixture($base, 'migrate-retired');
+	installed($app);
+	// The package stops declaring its managed entry point and its create-only config.
+	manifest($app, 'test/core', [
+		['target' => 'public/environment.txt', 'type' => 'text', 'policy' => 'managed', 'environments' => [
+			'dev' => ['source' => 'install/dev.stub'],
+			'stage' => ['source' => 'install/stage.stub'],
+			'prod' => ['source' => 'install/prod.stub'],
+		]],
+	]);
+
+	[$exit, $result, $output] = command($app, ['migrate']);
+	check($exit === 0, 'Retired scaffold files changed migrate exit behavior. ' . $output);
+	$retired = array_column($result['migration']['retired_scaffold_files'] ?? [], 'status', 'target');
+	check($retired === ['bin/tool' => 'unmodified', 'config/app.php' => 'app_owned'], 'Migrate did not list the retired files with their status: ' . json_encode($retired));
+	$report = file_get_contents((string)($result['migration_report'] ?? ''));
+	$section = strpos($report, '### Retired scaffold files');
+	check(
+		$section !== false && $section > strpos($report, '### Advisory create-only scaffold files') && $section < strpos($report, '### PHP lint failures'),
+		'Migration report does not list retired files right after the create-only review.'
+	);
+	check(str_contains($report, '- `test/core: bin/tool` — unmodified'), 'Migration report omitted the retired managed file.');
+
+	put($app . '/bin/tool', "local edit\n");
+	unlink($app . '/config/app.php');
+	[$exit, $result, $output] = command($app, ['migrate']);
+	check($exit === 0, 'A locally modified retired file changed migrate exit behavior. ' . $output);
+	$retired = array_column($result['migration']['retired_scaffold_files'] ?? [], 'status', 'target');
+	check($retired === ['bin/tool' => 'local_modified'], 'Migrate did not keep listing the remaining retired file: ' . json_encode($retired));
+	check(file_get_contents($app . '/bin/tool') === "local edit\n", 'Migrate changed a retired file.');
+};
+
 $tests['migration report sorts create-only review by app path and uses readable unique names'] = static function () use ($base): void {
 	$app = $base . '/apps/migration-report-order';
 	mkdir($app, 0775, true);
@@ -1053,7 +1086,7 @@ $tests['migration diagnostics omit secret and sensitive config diffs while keepi
 		]],
 	];
 
-	$diagnostics = new BuildMigrationDiagnostics(new ScaffoldRenderer(), new PlaceholderResolver($app));
+	$diagnostics = new BuildMigrationDiagnostics(new PathGuard($app), new ScaffoldRenderer(), new PlaceholderResolver($app));
 	$details = $diagnostics->inspectPlan($plan)['scaffold_diffs'];
 	$secret = $details[0];
 	$template = $details[1];

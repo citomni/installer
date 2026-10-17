@@ -1,12 +1,12 @@
 # Migration suite
 
-Isolated checks for the building blocks of `migrate`: how create-only targets are planned, generated `.new` sidecars, installer-config and source diagnostics, the app-skeleton audit, and the recursive PHP lint. No Composer, no database, no environment variables.
+Isolated checks for the building blocks of `migrate`: how create-only targets are planned, generated `.new` sidecars, installer-config, source and retired-file diagnostics, the app-skeleton audit, and the recursive PHP lint. No Composer, no database, no environment variables.
 
 ```
 php tests/migration/run.php
 ```
 
-Expected: `14 passed, 0 failed`
+Expected: `16 passed, 0 failed`
 
 `PASS` lines go to stdout, `FAIL` lines to stderr. The last line holds the totals, and the exit code is 1 when a check fails.
 
@@ -32,6 +32,8 @@ Diagnostics:
 - A missing derived placeholder (`PROD_ROOT_HOST`) is reported as its configurable source key (`PROD_ROOT_URL`), and a configured source of a required derived host is neither missing nor unused.
 - Percent-style source tokens are advisory and listed once per source.
 - Blocking review lists `.new` writes, conflicts, and failures, but not updates.
+- Retired files are the recorded targets that no manifest declares and that still exist: a managed file is `unmodified` or `local_modified` against its recorded checksum, a create-only file is `app_owned`, and a recorded path outside the application is skipped.
+- A retired target recorded by several packages is listed once, under its newest record.
 
 App-skeleton audit:
 

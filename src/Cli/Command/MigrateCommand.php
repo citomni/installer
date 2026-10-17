@@ -43,8 +43,9 @@ use CitOmni\Installer\Support\ScaffoldManifestLocator;
  * config/citomni_installer.php are skipped, and their stubs add no placeholder
  * requirements or source warnings. The installer block in .gitignore is refreshed, and a
  * missing .gitignore is created in a Git checkout; malformed block markers stop
- * migration before writing. App-skeleton references and recursive PHP lint are
- * included in the human-review report.
+ * migration before writing. App-skeleton references, recursive PHP lint, and existing
+ * files that v2 state records but no installed manifest declares any more are included
+ * in the human-review report.
  */
 final class MigrateCommand extends AbstractWriteCommand {
 
@@ -173,6 +174,8 @@ final class MigrateCommand extends AbstractWriteCommand {
 				return $gitignoreExit;
 			}
 			$planDiagnostics = $this->diagnostics->inspectPlan($plan);
+			// Legacy state holds no v2 records to compare with, and readPackages() rejects it.
+			$retired = $this->diagnostics->retiredScaffoldFiles($reconcileCurrent ? $this->state->readPackages() : [], $discovered);
 
 			$result = $this->materializer->apply($plan, $environment, ['dry_run' => $opt['dry_run']]);
 
@@ -215,6 +218,7 @@ final class MigrateCommand extends AbstractWriteCommand {
 				'scaffold_diffs' => $planDiagnostics['scaffold_diffs'],
 				'blocking_manual_review' => $this->diagnostics->blockingManualReview($result),
 				'advisory_manual_review' => $this->diagnostics->advisoryManualReview($result),
+				'retired_scaffold_files' => $retired,
 				'app_skeleton' => $appSkeleton,
 				'php_lint' => $phpLint,
 			];

@@ -159,7 +159,7 @@ final class InstallerCli {
 							$state,
 							$lock,
 							$materializer,
-							new BuildMigrationDiagnostics($renderer, $resolver),
+							new BuildMigrationDiagnostics($pathGuard, $renderer, $resolver),
 							new AppSkeletonReferenceFetcher(),
 							new AuditAppSkeletonMigration($pathGuard),
 							new MigrationReportWriter($pathGuard),
@@ -433,7 +433,9 @@ they do not block Composer posture or v2 state completion. Existing generated si
 are overwritten deliberately. Existing `*.tpl` targets are authoritative
 current templates. Create-only targets listed under omit in config/citomni_installer.php
 are skipped. The command also audits installer placeholders, reports advisory
-percent-style uppercase tokens found in current package scaffold sources, compares root
+percent-style uppercase tokens found in current package scaffold sources, lists existing
+files that v2 state records but no installed package declares any more (advisory; they
+are never updated or deleted), compares root
 references with one pinned current citomni/app-skeleton commit while ignoring line-ending
 and one final-newline difference, recursively runs
 `php -l` on app-owned `.php` and `.php.tpl` files, refreshes the citomni/installer

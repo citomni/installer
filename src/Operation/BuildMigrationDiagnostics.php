@@ -19,8 +19,11 @@ use CitOmni\Installer\Enum\Environment;
 use CitOmni\Installer\Exception\FilesystemException;
 use CitOmni\Installer\Exception\InstallerException;
 use CitOmni\Installer\State\ScaffoldState;
+use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\ScaffoldRenderer;
+use CitOmni\Installer\Util\Checksum;
+use CitOmni\Installer\Util\Path;
 use CitOmni\Installer\Util\UnifiedDiff;
 
 /**
@@ -34,6 +37,7 @@ use CitOmni\Installer\Util\UnifiedDiff;
  * - Never reads local non-template var/secrets target bytes into diff diagnostics.
  * - Omits diffs for config targets whose PHP array keys contain known sensitive credential fragments.
  * - Flags percent-style uppercase tokens in current scaffold sources as advisory source-hygiene warnings.
+ * - Lists recorded scaffold files that no installed manifest declares any more but that still exist.
  * - Produces a compact post-apply manual-review list for `.new`, conflicts, and failures.
  */
 final class BuildMigrationDiagnostics {
@@ -53,6 +57,7 @@ final class BuildMigrationDiagnostics {
 
 
 	public function __construct(
+		private readonly PathGuard $pathGuard,
 		private readonly ScaffoldRenderer $renderer,
 		private readonly PlaceholderResolver $placeholders
 	) {
@@ -419,6 +424,91 @@ final class BuildMigrationDiagnostics {
 		}
 
 		return $manual;
+	}
+
+
+	/**
+	 * List recorded scaffold files that no installed manifest declares any more but that still exist.
+	 *
+	 * Installer state keeps the record of every target the installer wrote or adopted, also after
+	 * its package stops declaring the target. No command plans such a target again, so the file
+	 * stays in the application until someone removes it. This read-only list names those files.
+	 *
+	 * Behavior:
+	 * - Lists a recorded target only when no manifest declares it, whichever package records it,
+	 *   and only when it is a regular file. On Windows, targets compare without regard to case.
+	 * - Lists a target once, under the record with the latest installed_at, also when several
+	 *   packages record it.
+	 * - The status compares the file with its record:
+	 *     - unmodified: a managed file that matches its recorded rendered checksum.
+	 *     - local_modified: a managed file that differs from it, or whose record has none.
+	 *     - app_owned: a file under any other policy, which the application owns after creation.
+	 * - Skips a recorded target that is not a safe app-relative path.
+	 *
+	 * @param array<string,mixed> $recorded Package baselines as ScaffoldState::readPackages() returns them.
+	 * @param array<string,array<string,mixed>> $manifests Manifests as ScaffoldManifestLocator::discover() returns them. A target left out of a filtered set counts as retired.
+	 * @return list<array{package:string,target:string,policy:string,status:string}>
+	 * @throws FilesystemException When a listed managed file cannot be read.
+	 */
+	public function retiredScaffoldFiles(array $recorded, array $manifests): array {
+		$caseInsensitive = \PHP_OS_FAMILY === 'Windows';
+		$declared = [];
+		foreach ($manifests as $manifest) {
+			foreach ((array)($manifest['files'] ?? []) as $file) {
+				$target = (string)($file['target'] ?? '');
+				$declared[$caseInsensitive ? \strtolower($target) : $target] = true;
+			}
+		}
+
+		$newest = [];
+		foreach ($recorded as $package => $record) {
+			foreach ((array)($record['files'] ?? []) as $target => $data) {
+				$target = (string)$target;
+				// The installer records only safe app-relative targets; any other key must not steer a read.
+				if (!\is_array($data) || !Path::isSafeRelative($target)) {
+					continue;
+				}
+
+				$target = Path::normalizeRelative($target);
+				$key = $caseInsensitive ? \strtolower($target) : $target;
+				$installedAt = (string)($data['installed_at'] ?? '');
+				if (isset($declared[$key]) || (isset($newest[$key]) && \strcmp($installedAt, $newest[$key]['installed_at']) <= 0)) {
+					continue;
+				}
+
+				$newest[$key] = ['package' => (string)$package, 'target' => $target, 'installed_at' => $installedAt, 'data' => $data];
+			}
+		}
+
+		$retired = [];
+		foreach ($newest as $entry) {
+			// Only read, never written, so a plain join suffices; resolveTarget() would fail migrate
+			// on an application symlink that leaves the app root.
+			$path = $this->pathGuard->appRoot() . '/' . $entry['target'];
+			if (!\is_file($path)) {
+				continue;
+			}
+
+			$policy = (string)($entry['data']['policy'] ?? '');
+			$status = 'app_owned';
+			if ($policy === 'managed') {
+				$bytes = \file_get_contents($path);
+				if ($bytes === false) {
+					throw new FilesystemException('Cannot read retired scaffold target: ' . $entry['target']);
+				}
+				$recordedChecksum = (string)($entry['data']['rendered_checksum'] ?? '');
+				$status = $recordedChecksum !== '' && Checksum::matches($bytes, $recordedChecksum) ? 'unmodified' : 'local_modified';
+			}
+
+			$retired[] = [
+				'package' => $entry['package'],
+				'target' => $entry['target'],
+				'policy' => $policy,
+				'status' => $status,
+			];
+		}
+
+		return $retired;
 	}
 
 

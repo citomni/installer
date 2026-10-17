@@ -47,6 +47,7 @@ final class MigrationReportWriter {
 		$migration = \is_array($result['migration'] ?? null) ? $result['migration'] : [];
 		$blocking = (array)($migration['blocking_manual_review'] ?? []);
 		$advisoryScaffold = $this->sortReviewItemsByTarget((array)($migration['advisory_manual_review'] ?? []));
+		$retired = $this->sortReviewItemsByTarget((array)($migration['retired_scaffold_files'] ?? []));
 		$appSkeleton = \is_array($migration['app_skeleton'] ?? null) ? $migration['app_skeleton'] : [];
 		$advisory = (array)($appSkeleton['manual_review'] ?? []);
 		$config = \is_array($migration['installer_config'] ?? null) ? $migration['installer_config'] : [];
@@ -72,6 +73,7 @@ final class MigrationReportWriter {
 		}
 		$out .= '- Blocking manual-review files: ' . \count($blocking) . "\n";
 		$out .= '- Advisory create-only scaffold review files: ' . \count($advisoryScaffold) . "\n";
+		$out .= '- Retired scaffold files: ' . \count($retired) . "\n";
 		$out .= '- Advisory app-skeleton review files: ' . \count($advisory) . "\n";
 		if ($phpLint !== []) {
 			$out .= '- PHP lint checked: ' . (int)($phpLint['checked'] ?? 0) . "\n";
@@ -103,6 +105,16 @@ final class MigrationReportWriter {
 				$out .= "\n";
 			}
 			$out .= "\nThese create-only files are app-owned after creation. Local differences are expected, remain untouched, and do not prevent Composer posture or v2 scaffold state from being committed. The `.new` files are refreshed current-source references and will continue to be reported on later migrate runs while differences remain.\n\n";
+		}
+
+		$out .= "### Retired scaffold files\n\n";
+		if ($retired === []) {
+			$out .= "None.\n\n";
+		} else {
+			foreach ($retired as $item) {
+				$out .= '- `' . (string)($item['package'] ?? '') . ': ' . (string)($item['target'] ?? '') . '` — ' . (string)($item['status'] ?? '') . "\n";
+			}
+			$out .= "\nInstaller state records these files, but no installed package declares them any more. The installer neither updates nor deletes them; delete each file once nothing in the application uses it. `unmodified` is a managed file that still matches the bytes the installer recorded, `local_modified` a managed file changed since, and `app_owned` a create-only file. The installer block in `.gitignore` does not list a retired managed file, so Git may show it as untracked.\n\n";
 		}
 
 		$out .= "### PHP lint failures\n\n";

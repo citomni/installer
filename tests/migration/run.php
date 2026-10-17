@@ -25,11 +25,12 @@ use CitOmni\Installer\Support\PathGuard;
 use CitOmni\Installer\Support\PhpLintRunner;
 use CitOmni\Installer\Support\PlaceholderResolver;
 use CitOmni\Installer\Support\ScaffoldRenderer;
+use CitOmni\Installer\Util\Checksum;
 
 /*
  * Standalone suite for the building blocks of `migrate`: how create-only targets are
- * planned, generated `.new` sidecars, installer-config and source diagnostics, the
- * app-skeleton audit, and the recursive PHP lint.
+ * planned, generated `.new` sidecars, installer-config, source and retired-file
+ * diagnostics, the app-skeleton audit, and the recursive PHP lint.
  *
  * Every check gets a fresh application root and package root in its own run
  * directory, which is removed afterwards. The lint check starts `php -l` processes
@@ -177,7 +178,7 @@ function export(mixed $value): string {
 
 /** Diagnostics reading config/citomni_installer.php below the fixture's application root. */
 function diagnostics(Fixture $f): BuildMigrationDiagnostics {
-	return new BuildMigrationDiagnostics(new ScaffoldRenderer(), new PlaceholderResolver($f->app));
+	return new BuildMigrationDiagnostics(new PathGuard($f->app), new ScaffoldRenderer(), new PlaceholderResolver($f->app));
 }
 
 
@@ -342,6 +343,40 @@ $checks = [
 			]],
 		]);
 		same(['a.php', 'b.php', 'c.php'], \array_column($manual, 'target'), 'blocking targets');
+	},
+
+	'retired files are existing recorded targets that no manifest declares, with their baseline status' => static function (Fixture $f): void {
+		$f->appFile('bin/clean', "clean\n");
+		$f->appFile('bin/edited', "edited\n");
+		$f->appFile('src/Demo.php', "<?php\n");
+		$f->appFile('config/moved.php', "<?php\n");
+		\file_put_contents($f->dir . '/outside', "outside\n");
+		$recorded = [PACKAGE => ['files' => [
+			'bin/clean'        => ['policy' => 'managed', 'rendered_checksum' => Checksum::sha256("clean\n")],
+			'bin/edited'       => ['policy' => 'managed', 'rendered_checksum' => Checksum::sha256("original\n")],
+			'src/Demo.php'     => ['policy' => 'create-only'],
+			'bin/deleted'      => ['policy' => 'managed', 'rendered_checksum' => Checksum::sha256("deleted\n")],
+			'config/moved.php' => ['policy' => 'create-only'],
+			'../outside'       => ['policy' => 'create-only'],
+		]]];
+		$manifests = ['acme/other' => ['files' => [['target' => 'config/moved.php']]]];
+
+		same([
+			['package' => PACKAGE, 'target' => 'bin/clean', 'policy' => 'managed', 'status' => 'unmodified'],
+			['package' => PACKAGE, 'target' => 'bin/edited', 'policy' => 'managed', 'status' => 'local_modified'],
+			['package' => PACKAGE, 'target' => 'src/Demo.php', 'policy' => 'create-only', 'status' => 'app_owned'],
+		], diagnostics($f)->retiredScaffoldFiles($recorded, $manifests), 'retired files');
+	},
+
+	'a retired target recorded by several packages is listed once, under its newest record' => static function (Fixture $f): void {
+		$f->appFile('config/shared.php', "<?php\n");
+		$recorded = [
+			'acme/old'    => ['files' => ['config/shared.php' => ['policy' => 'create-only', 'installed_at' => '2026-08-01T00:00:00+00:00']]],
+			'acme/newest' => ['files' => ['config/shared.php' => ['policy' => 'create-only', 'installed_at' => '2026-10-01T00:00:00+00:00']]],
+			'acme/middle' => ['files' => ['config/shared.php' => ['policy' => 'create-only', 'installed_at' => '2026-09-01T00:00:00+00:00']]],
+		];
+
+		same(['acme/newest'], \array_column(diagnostics($f)->retiredScaffoldFiles($recorded, []), 'package'), 'packages');
 	},
 
 	// -- App-skeleton audit -----------------------------------------

@@ -11,10 +11,10 @@ php tests/lifecycle/run.php
 Expected result on Linux and macOS:
 
 ```
-68 passed, 0 failed, 2 skipped
+69 passed, 0 failed, 2 skipped
 ```
 
-Expected result on Windows: `68 passed, 0 failed, 2 skipped` when PHP can create symlinks, otherwise `63 passed, 0 failed, 7 skipped`. PHP on Windows creates symlinks only in an elevated prompt or with the "Create symbolic links" user right; Developer Mode is not enough.
+Expected result on Windows: `69 passed, 0 failed, 2 skipped` when PHP can create symlinks, otherwise `64 passed, 0 failed, 7 skipped`. PHP on Windows creates symlinks only in an elevated prompt or with the "Create symbolic links" user right; Developer Mode is not enough.
 
 `PASS` and `SKIP` lines go to stdout, `FAIL` lines to stderr. The last line holds the totals, and the exit code is 1 when a check fails.
 
@@ -24,7 +24,7 @@ The real Composer check runs only when the suite gets the path to a Composer PHA
 php tests/lifecycle/run.php --composer=/absolute/path/to/composer.phar
 ```
 
-Expected result with `--composer`: `69 passed, 0 failed, 1 skipped` on Linux and macOS, and on Windows when PHP can create symlinks; otherwise `64 passed, 0 failed, 6 skipped` on Windows.
+Expected result with `--composer`: `70 passed, 0 failed, 1 skipped` on Linux and macOS, and on Windows when PHP can create symlinks; otherwise `65 passed, 0 failed, 6 skipped` on Windows.
 
 The check isolates `COMPOSER_HOME` and runs only `config` and `dump-autoload` on local fixtures; it resolves and downloads nothing. The PHAR must run with the PHP binary that runs the suite.
 
@@ -44,7 +44,7 @@ The checks in `run.php` cover, in this order:
 - Environment switching, including a dev, stage, prod, dev cycle that checks every dry run, the recorded environment, the Composer posture, the rendered target, the backup of the previous environment, and `status` after each switch.
 - `bin/citomni-installer` through a Composer proxy: it installs the application it is run from and refuses a directory without `composer.json`.
 - Unsafe state paths, Unix modes, discovery that foreign Composer metadata cannot redirect, and IO failures.
-- `migrate`: legacy rebuild, reconciliation, dry runs, PHP lint, the app-skeleton audit, source warnings, the migration report, and the state format boundaries.
+- `migrate`: legacy rebuild, reconciliation, dry runs, PHP lint, the app-skeleton audit, source warnings, retired scaffold files, the migration report, and the state format boundaries.
 - The installer block in `.gitignore`.
 - Omitting create-only targets through `omit` in `config/citomni_installer.php`.
 - The real Composer check.
