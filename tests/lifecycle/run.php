@@ -805,6 +805,7 @@ $tests['migrate reconciles an already current v2 application and defaults to dev
 	check(($result['environment'] ?? null) === 'dev', 'Migrate without --environment did not default to dev.');
 	check(($result['migration']['mode'] ?? null) === 'reconcile_v2', 'Current v2 migrate did not enter reconciliation mode.');
 	check(ScaffoldState::forAppRoot($app)->environment() === Environment::DEV, 'Current v2 reconciliation lost the recorded environment.');
+	check(resultFile($result, 'config/app.php')['applied'] === 'skipped', 'Reconciliation recorded a clean create-only target again although its record was current.');
 
 	put($app . '/bin/tool', "local managed edit\n");
 	put($app . '/bin/tool.new', "stale generated sidecar\n");

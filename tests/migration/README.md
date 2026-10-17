@@ -6,7 +6,7 @@ Isolated checks for the building blocks of `migrate`: how create-only targets ar
 php tests/migration/run.php
 ```
 
-Expected: `16 passed, 0 failed`
+Expected: `19 passed, 0 failed`
 
 `PASS` lines go to stdout, `FAIL` lines to stderr. The last line holds the totals, and the exit code is 1 when a check fails.
 
@@ -21,6 +21,8 @@ Create-only targets:
 - PHP that differs only in comments, PHPDoc, or whitespace is refreshed with a backup.
 - PHP with a code difference, and any other file with a content difference, gets a `.new` reference.
 - A `.tpl` target is refreshed authoritatively with a backup.
+- In reconcile mode, a clean target whose record already holds the current source, placeholders and stub checksum is skipped and keeps its record; a missing or outdated record is recorded again.
+- A skipped target that changes after planning still conflicts during apply.
 
 Generated sidecars:
 

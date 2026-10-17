@@ -66,6 +66,9 @@ const RUN_DIR_PREFIX = 'citomni_installer_migration_';
 
 const PACKAGE = 'acme/pkg';
 
+/** installed_at of the records a check writes, so a rewritten record shows. */
+const RECORDED_AT = '2026-10-01T00:00:00+00:00';
+
 
 /**
  * A failed expectation, reported as FAIL with its message.
@@ -133,6 +136,42 @@ final class Fixture {
 		$plan     = (new BuildScaffoldPlan($guard, $renderer, $state))->build('migrate', $this->createOnlyManifest($target, $source), [PACKAGE => []]);
 		$result   = (new ApplyScaffoldPlan($guard, $renderer, $state))->apply($plan, ['persist_state' => false]);
 		return $result['packages'][0]['files'][0];
+	}
+
+
+	/**
+	 * The migrate plan entry for one create-only target in reconcile mode, against the recorded state.
+	 *
+	 * @return array<string,mixed>
+	 */
+	public function reconcilePlanEntry(string $target, string $source): array {
+		$plan = $this->builder()->build('migrate', $this->createOnlyManifest($target, $source), [PACKAGE => []], ['migration_reconcile' => true]);
+		return $plan['packages'][0]['files'][0];
+	}
+
+
+	/**
+	 * Apply one migrate plan entry without persisting state.
+	 *
+	 * @param array<string,mixed> $entry
+	 * @return array<string,mixed> The apply result, including the state packages it would write.
+	 */
+	public function applyMigrateEntry(array $entry): array {
+		$plan = ['command' => 'migrate', 'packages' => [['name' => PACKAGE, 'installed_version' => '1.0.0', 'files' => [$entry]]]];
+		return (new ApplyScaffoldPlan(new PathGuard($this->app), new ScaffoldRenderer(), ScaffoldState::forAppRoot($this->app)))->apply($plan, ['persist_state' => false]);
+	}
+
+
+	/** Record $target in v2 state as a create-only file rendered from $source without placeholders. */
+	public function recordCreateOnly(string $target, string $source, string $stubChecksum): void {
+		ScaffoldState::forAppRoot($this->app)->writePackagesAndEnvironment([PACKAGE => ['installed_version' => '1.0.0', 'files' => [$target => [
+			'source'        => $source,
+			'type'          => 'config',
+			'policy'        => 'create-only',
+			'stub_checksum' => $stubChecksum,
+			'placeholders'  => [],
+			'installed_at'  => RECORDED_AT,
+		]]]], Environment::DEV);
 	}
 
 
@@ -281,6 +320,44 @@ $checks = [
 
 		$entry = $f->migratePlanEntry('config/example.txt', 'install/example.txt.stub');
 		same(['write_new', 'migration_content_difference'], [$entry['action'], $entry['reason']], 'action, reason');
+	},
+
+	'a clean create-only target whose record holds the current input is skipped and keeps its record' => static function (Fixture $f): void {
+		$stub = "<?php\nreturn ['enabled' => true];\n";
+		$f->appFile('config/example.php', $stub);
+		$f->packageFile('install/example.php.stub', $stub);
+		$f->recordCreateOnly('config/example.php', 'install/example.php.stub', Checksum::sha256($stub));
+
+		$entry = $f->reconcilePlanEntry('config/example.php', 'install/example.php.stub');
+		same(['none', 'create_only_present'], [$entry['action'], $entry['reason']], 'action, reason');
+		$result = $f->applyMigrateEntry($entry);
+		same('skipped', $result['packages'][0]['files'][0]['applied'] ?? null, 'applied');
+		same(RECORDED_AT, $result['_state_packages'][PACKAGE]['files']['config/example.php']['installed_at'] ?? null, 'recorded installed_at');
+	},
+
+	'a clean create-only target is recorded when its record is missing or outdated' => static function (Fixture $f): void {
+		$stub = "<?php\nreturn ['enabled' => true];\n";
+		$f->appFile('config/example.php', $stub);
+		$f->packageFile('install/example.php.stub', $stub);
+
+		ScaffoldState::forAppRoot($f->app)->writePackagesAndEnvironment([], Environment::DEV);
+		$entry = $f->reconcilePlanEntry('config/example.php', 'install/example.php.stub');
+		same(['register_state', 'adopt_clean_baseline'], [$entry['action'], $entry['reason']], 'without a record');
+
+		$f->recordCreateOnly('config/example.php', 'install/example.php.stub', Checksum::sha256("<?php\nreturn [];\n"));
+		$entry = $f->reconcilePlanEntry('config/example.php', 'install/example.php.stub');
+		same(['register_state', 'adopt_clean_baseline'], [$entry['action'], $entry['reason']], 'with another stub checksum');
+	},
+
+	'a skipped create-only target that changes after planning conflicts' => static function (Fixture $f): void {
+		$stub = "<?php\nreturn ['enabled' => true];\n";
+		$f->appFile('config/example.php', $stub);
+		$f->packageFile('install/example.php.stub', $stub);
+		$f->recordCreateOnly('config/example.php', 'install/example.php.stub', Checksum::sha256($stub));
+
+		$entry = $f->reconcilePlanEntry('config/example.php', 'install/example.php.stub');
+		$f->appFile('config/example.php', "<?php\nreturn ['enabled' => false];\n");
+		same('conflict', $f->applyMigrateEntry($entry)['packages'][0]['files'][0]['applied'] ?? null, 'applied');
 	},
 
 	// -- Generated sidecars -----------------------------------------

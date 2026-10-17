@@ -611,6 +611,12 @@ final class BuildScaffoldPlan {
 		$ctx['disk'] = $disk;
 		$ctx['currentCk'] = $ck;
 		if (Checksum::matches($disk, $ck[1])) {
+			if ($this->recordedInputMatches($ctx, $ck)) {
+				// Nothing to record. The apply block keeps the freshness checks that
+				// register_state runs, so a target changed after planning still conflicts.
+				return ['action' => 'none', 'apply' => $this->applyState($ctx, $ctx['pkgPlaceholders'], $ck)];
+			}
+
 			return [
 				'action' => 'register_state',
 				'reason' => 'adopt_clean_baseline',
@@ -765,14 +771,28 @@ final class BuildScaffoldPlan {
 	 * @return bool Whether repair can already reproduce the current source/input.
 	 */
 	private function recordedBaselineMatches(array $ctx, array $ck): bool {
+		return $this->recordedInputMatches($ctx, $ck)
+			&& Checksum::equals((string)($ctx['stateFile']['rendered_checksum'] ?? ''), $ck[1]);
+	}
+
+	/**
+	 * Compare the recorded source, type, policy, placeholders and stub checksum with the current ones.
+	 *
+	 * The rendered checksum is left out, so the comparison also fits a create-only record,
+	 * which carries none.
+	 *
+	 * @param array<string,mixed> $ctx Current file context.
+	 * @param array{0:string,1:string} $ck Current stub and rendered checksums.
+	 * @return bool Whether the record already holds the current reproduction input.
+	 */
+	private function recordedInputMatches(array $ctx, array $ck): bool {
 		$stateFile = $ctx['stateFile'];
 		return \is_array($stateFile)
 			&& ($stateFile['source'] ?? null) === $ctx['normSource']
 			&& ($stateFile['type'] ?? null) === $ctx['type']
 			&& ($stateFile['policy'] ?? null) === $ctx['policy']
 			&& ($stateFile['placeholders'] ?? null) === $ctx['pkgPlaceholders']
-			&& Checksum::equals((string)($stateFile['stub_checksum'] ?? ''), $ck[0])
-			&& Checksum::equals((string)($stateFile['rendered_checksum'] ?? ''), $ck[1]);
+			&& Checksum::equals((string)($stateFile['stub_checksum'] ?? ''), $ck[0]);
 	}
 
 
